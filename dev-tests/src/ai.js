@@ -3,12 +3,29 @@
 // lookahead, curvature-based braking (not fixed brake points), handbrake
 // pulses to initiate real drifts, and mild rubber-banding.
 
+import { CONFIG } from "./car.js";
+
 export const AI_TIERS = [
   { name: "VEX",   color: 0xe6484d, pace: 1.00, driftiness: 1.0  },
   { name: "KAIRO", color: 0xf08a2e, pace: 0.975, driftiness: 0.75 },
   { name: "MIRA",  color: 0x9a5be8, pace: 0.95, driftiness: 0.5  },
   { name: "JOLT",  color: 0x3ecf6e, pace: 0.92, driftiness: 0.35 },
 ];
+
+// Bots park for good once they finish the race: hidden, excluded from physics
+// and collisions. Returns the cars still racing.
+export function finishCars(aiCars, laps) {
+  const active = [];
+  for (const c of aiCars) {
+    if (!c.finished && c.prog && c.prog.lap >= laps) {
+      c.finished = true;
+      c.mesh.visible = false;
+      if (c.shadow) c.shadow.visible = false;
+    }
+    if (!c.finished) active.push(c);
+  }
+  return active;
+}
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
@@ -17,10 +34,17 @@ export class AIDriver {
     this.car = car;
     this.track = track;
     this.tier = tier;
-    this.topSpeed = 37.5 * tier.pace;
+    this.skill = 1;
+    this.setSkill(1);
     this.driftTimer = 0;
     this.driftCooldown = 0;
     car.aiName = tier.name;
+  }
+
+  // difficulty: scales top speed and engine (0.9 easy .. 1.06 hard)
+  setSkill(k) {
+    this.skill = k;
+    this.topSpeed = CONFIG.TOP_SPEED * (0.94 + this.tier.pace * 0.06) * k;
   }
 
   // ctx: { playerTotal } — race progress of the player, for rubber-banding
@@ -35,7 +59,7 @@ export class AIDriver {
       const delta = ctx.playerTotal - car.prog.total; // >0 means this AI is behind
       rubber = clamp(1 + delta * 0.0009, 0.94, 1.06);
     }
-    car.engineScale = this.tier.pace * rubber;
+    car.engineScale = this.tier.pace * rubber * this.skill;
 
     // --- pure-pursuit steering with speed-scaled lookahead ---
     const look = clamp(v * 0.6, 7, 24);

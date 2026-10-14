@@ -84,9 +84,10 @@ export const CONFIG = {
 // flat decel (m/s^2) while rolling.
 // ---------------------------------------------------------------------------
 export const SURFACES = {
-  asphalt: { grip: 1.0,  engine: 1.0,  drag: 0,   tint: [0.24, 0.25, 0.28] },
-  dirt:    { grip: 0.5,  engine: 0.62, drag: 7.0, tint: [0.5, 0.36, 0.2] },
-  ice:     { grip: 0.3,  engine: 0.55, drag: 0,   tint: [0.5, 0.72, 0.88] },
+  // tint multiplies the procedural asphalt texture (mid-grey noise)
+  asphalt: { grip: 1.0,  engine: 1.0,  drag: 0,   tint: [0.30, 0.31, 0.36] },
+  dirt:    { grip: 0.5,  engine: 0.62, drag: 7.0, tint: [0.78, 0.52, 0.28] },
+  ice:     { grip: 0.3,  engine: 0.55, drag: 0,   tint: [0.72, 0.9, 1.0] },
   kerb:    { grip: 0.85, engine: 0.8,  drag: 3.0, tint: [0.75, 0.2, 0.2] },
 };
 
@@ -97,48 +98,75 @@ const clamp = THREE.MathUtils.clamp;
 // ---------------------------------------------------------------------------
 export function buildCarMesh(color = 0x3ea6ff, ghost = false) {
   const group = new THREE.Group();
-  const mat = (c) => ghost
-    ? new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.32, depthWrite: false })
-    : new THREE.MeshPhongMaterial({ color: c, shininess: 70, specular: 0x4a5a6d });
+  const basic = (c, op = 0.32) => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: op, depthWrite: false });
+  const paint = ghost ? basic(color)
+    : new THREE.MeshStandardMaterial({ color, metalness: 0.55, roughness: 0.32, envMapIntensity: 0.9 });
+  const dark = ghost ? basic(color) : new THREE.MeshStandardMaterial({ color: 0x15191f, metalness: 0.3, roughness: 0.65 });
+  const glass = ghost ? basic(color) : new THREE.MeshStandardMaterial({ color: 0x16283a, metalness: 0.85, roughness: 0.12 });
+  const rim = ghost ? basic(color) : new THREE.MeshStandardMaterial({ color: 0xb9c2cc, metalness: 0.9, roughness: 0.3 });
+  const headMat = ghost ? basic(color) : new THREE.MeshStandardMaterial({ color: 0xfffbe8, emissive: 0xfff2c0, emissiveIntensity: 1.2, roughness: 0.3 });
+  const tailMat = ghost ? basic(color) : new THREE.MeshStandardMaterial({ color: 0x5a0a0a, emissive: 0xff2a1a, emissiveIntensity: 0.35, roughness: 0.4 });
 
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.42, 2.9), mat(color));
-  body.position.y = 0.5;
-  group.add(body);
+  const box = (w, h, d, mat, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    group.add(m);
+    return m;
+  };
 
-  const nose = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.24, 0.7), mat(color));
-  nose.position.set(0, 0.4, 1.68);
-  group.add(nose);
+  // chassis, hood (sloping to the nose), rear deck, splitter, skirts
+  const body = box(1.5, 0.34, 3.0, paint, 0, 0.47, 0);
+  const hood = box(1.42, 0.16, 1.1, paint, 0, 0.68, 0.9);
+  hood.rotation.x = 0.1;
+  box(1.42, 0.16, 0.8, paint, 0, 0.7, -1.05);
+  box(1.56, 0.1, 0.5, dark, 0, 0.3, 1.62);
+  box(0.1, 0.12, 2.4, dark, -0.78, 0.3, -0.1);
+  box(0.1, 0.12, 2.4, dark, 0.78, 0.3, -0.1);
+  // cabin: tinted glass block + painted roof
+  box(1.15, 0.36, 1.3, glass, 0, 0.9, -0.15);
+  box(1.0, 0.06, 0.95, paint, 0, 1.1, -0.2);
+  // lights
+  box(0.34, 0.1, 0.06, headMat, -0.5, 0.58, 1.52);
+  box(0.34, 0.1, 0.06, headMat, 0.5, 0.58, 1.52);
+  box(0.44, 0.1, 0.06, tailMat, -0.45, 0.66, -1.52);
+  box(0.44, 0.1, 0.06, tailMat, 0.45, 0.66, -1.52);
+  // rear wing on struts
+  box(1.6, 0.06, 0.42, dark, 0, 1.02, -1.4);
+  box(0.06, 0.26, 0.26, dark, -0.55, 0.86, -1.4);
+  box(0.06, 0.26, 0.26, dark, 0.55, 0.86, -1.4);
 
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.36, 1.3), mat(ghost ? color : 0x18222c));
-  cabin.position.set(0, 0.86, -0.3);
-  group.add(cabin);
-
-  const wing = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.08, 0.4), mat(ghost ? color : 0x111418));
-  wing.position.set(0, 0.86, -1.5);
-  group.add(wing);
-
-  const wheelGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.3, 12);
-  wheelGeo.rotateZ(Math.PI / 2); // cylinder axis -> x, so rotating on x spins the wheel
-  const wheelMat = mat(ghost ? color : 0x14161a);
+  // wheels: tyre + bright rim, front pair in steering groups
+  const tyreGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.3, 14);
+  tyreGeo.rotateZ(Math.PI / 2); // cylinder axis -> x, so rotating on x spins the wheel
+  const rimGeo = new THREE.CylinderGeometry(0.2, 0.2, 0.32, 8);
+  rimGeo.rotateZ(Math.PI / 2);
+  const tyreMat = ghost ? basic(color) : dark;
   const wheels = [];
-  const fl = new THREE.Group();
-  const fr = new THREE.Group();
+  const makeWheel = () => {
+    const w = new THREE.Group();
+    w.add(new THREE.Mesh(tyreGeo, tyreMat));
+    w.add(new THREE.Mesh(rimGeo, rim));
+    wheels.push(w);
+    return w;
+  };
+  const fl = new THREE.Group(), fr = new THREE.Group();
   fl.position.set(-0.78, 0.34, 1.1);
   fr.position.set(0.78, 0.34, 1.1);
-  fl.add(new THREE.Mesh(wheelGeo, wheelMat));
-  fr.add(new THREE.Mesh(wheelGeo, wheelMat));
-  wheels.push(fl.children[0], fr.children[0]);
+  fl.add(makeWheel());
+  fr.add(makeWheel());
   for (const x of [-0.78, 0.78]) {
-    const w = new THREE.Mesh(wheelGeo, wheelMat);
+    const w = makeWheel();
     w.position.set(x, 0.34, -1.15);
     group.add(w);
-    wheels.push(w);
   }
   group.add(fl, fr);
+
+  if (!ghost) group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
 
   group.userData.wheels = wheels;
   group.userData.frontAxle = [fl, fr];
   group.userData.body = body;
+  group.userData.tailMat = ghost ? null : tailMat;
   return group;
 }
 
@@ -171,6 +199,9 @@ export class Car {
     this.wallHit = false;  // set by track.resolveCollision, consumed here
     this.engineScale = 1;  // AI rubber-band hook (player stays 1)
     this.wheelSpin = 0;
+    this.finished = false; // AI parks permanently after the final lap
+    this.braking = false;  // brake lights
+    this.lightGlow = 0.35; // smoothed tail-light intensity
 
     // vertical state (jumps)
     this.vy = 0;
@@ -186,10 +217,10 @@ export class Car {
     scene.add(this.mesh);
 
     // soft blob shadow that grounds the car visually (stays on the terrain)
-    const shadowGeo = new THREE.CircleGeometry(1.55, 20);
+    const shadowGeo = new THREE.CircleGeometry(1.4, 20);
     shadowGeo.rotateX(-Math.PI / 2);
     this.shadow = new THREE.Mesh(shadowGeo,
-      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.3, depthWrite: false }));
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.16, depthWrite: false }));
     this.shadow.renderOrder = 4;
     scene.add(this.shadow);
 
@@ -232,6 +263,7 @@ export class Car {
     // --- smooth the (binary keyboard) steering input a little ---
     const steerIn = clamp(input.steer || 0, -1, 1);
     this.steerSmooth += (steerIn - this.steerSmooth) * Math.min(1, C.STEER_SPEED * dt);
+    this.braking = (input.brake || 0) > 0.2 || !!input.handbrake;
 
     // --- airborne: ballistic arc. Brake in flight = Trackmania airbrake:
     // strong aero drag + drops you short. No grip/engine authority in the air.
@@ -457,7 +489,14 @@ export class Car {
     // blob shadow: on the surface while grounded, left behind on the ground while airborne
     const groundY = this.grounded ? this.pos.y : (this._lastGround !== undefined ? this._lastGround : 0);
     this.shadow.position.set(this.pos.x, groundY + 0.03, this.pos.z);
-    this.shadow.material.opacity = this.grounded ? 0.3 : Math.max(0.04, 0.3 - (this.pos.y - groundY) * 0.05);
+    this.shadow.material.opacity = this.grounded ? 0.16 : Math.max(0.03, 0.16 - (this.pos.y - groundY) * 0.03);
+    // brake lights
+    const tail = this.mesh.userData.tailMat;
+    if (tail) {
+      const want = this.braking ? 2.2 : 0.35;
+      this.lightGlow += (want - this.lightGlow) * Math.min(1, 18 * dt + (dt === 0 ? 0 : 0));
+      tail.emissiveIntensity = this.lightGlow;
+    }
   }
 }
 

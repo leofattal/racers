@@ -118,6 +118,40 @@ export const TRACKS = [
   },
 ];
 
+// procedural road texture: mid-grey speckle noise (surface tint multiplies it)
+function makeAsphaltTexture() {
+  if (typeof document === "undefined") return null;
+  const size = 256;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const ctx = c.getContext("2d");
+  const img = ctx.createImageData(size, size);
+  for (let i = 0; i < size * size; i++) {
+    const n = 0.5 + (Math.random() - 0.5) * 0.28 + (Math.random() - 0.5) * 0.1;
+    const v = Math.round(n * 255);
+    img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 8;
+  return t;
+}
+
+function makeCheckerTexture(cols = 12, rows = 2) {
+  if (typeof document === "undefined") return null;
+  const c = document.createElement("canvas");
+  c.width = cols * 16; c.height = rows * 16;
+  const ctx = c.getContext("2d");
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    ctx.fillStyle = (x + y) & 1 ? "#f4f4f4" : "#111";
+    ctx.fillRect(x * 16, y * 16, 16, 16);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.encoding = THREE.sRGBEncoding;
+  return t;
+}
+
 const SAMPLES = 512;
 const HALF_WIDTH = 7.5;
 const GATE_COUNT = 8;
@@ -450,10 +484,11 @@ export class Track {
     const { px, pz, nx, nz, hh, ss: sArr } = this;
 
     const strip = (offA, offB, yOff, material, colors) => {
-      const pos = [], col = [], idx = [];
+      const pos = [], col = [], idx = [], uv = [];
       for (let i = 0; i < N; i++) {
         pos.push(px[i] + nx[i] * offA, hh[i] + yOff, pz[i] + nz[i] * offA);
         pos.push(px[i] + nx[i] * offB, hh[i] + yOff, pz[i] + nz[i] * offB);
+        uv.push(0, sArr[i] / 9, 1, sArr[i] / 9);
         if (colors) {
           const c = colors(i);
           col.push(c[0], c[1], c[2], c[0], c[1], c[2]);
@@ -461,14 +496,17 @@ export class Track {
       }
       for (let i = 0; i < N; i++) {
         const a = 2 * i, b = 2 * i + 1, c = 2 * ((i + 1) % N), d = 2 * ((i + 1) % N) + 1;
-        idx.push(a, b, c, b, d, c);
+        idx.push(a, c, b, b, c, d); // wound so the normal points up (shadow bias)
       }
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
       if (colors) g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
       g.setIndex(idx);
       g.computeVertexNormals();
-      return this.addMesh(scene, new THREE.Mesh(g, material));
+      const m = new THREE.Mesh(g, material);
+      m.receiveShadow = true;
+      return this.addMesh(scene, m);
     };
 
     // Decals sit just above the road: polygonOffset + clearance beats
@@ -478,19 +516,48 @@ export class Track {
       polygonOffsetUnits: -2, ...opts,
     });
 
-    // road surface — ramps hazard-orange, dirt brown, ice pale blue
+    // road surface — textured asphalt; ramps hazard-orange, dirt brown, ice pale blue
     const inRamp = (s) => this.rampsWorld.some((r) => s >= r.s0 && s <= r.s1);
+    const asphalt = makeAsphaltTexture();
     strip(-hw, hw, 0,
-      new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+      new THREE.MeshStandardMaterial({ map: asphalt, vertexColors: true, side: THREE.DoubleSide, roughness: 0.95, metalness: 0.0, envMapIntensity: 0.25 }),
       (i) => {
-        if (inRamp(sArr[i])) return [0.95, 0.5, 0.12];
+        if (inRamp(sArr[i])) return [0.9, 0.42, 0.1];
         const st = SURFACES[this.surfaceAt(sArr[i])] || SURFACES.asphalt;
         return st.tint;
       });
 
-    // white edge lines
-    strip(-hw + 0.15, -hw + 0.5, 0.045, decal({ color: 0xd8dde6 }));
-    strip(hw - 0.5, hw - 0.15, 0.045, decal({ color: 0xd8dde6 }));
+    // kerbs: red/white rumble strips through the corners, plain white lines
+    // on the straights
+    const kerbRed = [0.9, 0.16, 0.14], kerbWhite = [0.95, 0.95, 0.93], lineWhite = [0.88, 0.9, 0.94];
+    const kerbMat = () => new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    const kerbColor = (i) => Math.abs(this.kappa[i]) > 0.011 ? (((i / 3) | 0) & 1 ? kerbRed : kerbWhite) : lineWhite;
+    const kerbWidth = (i) => Math.abs(this.kappa[i]) > 0.011 ? 0.9 : 0.35;
+    for (const side of [-1, 1]) {
+      const pos = [], col = [], idx = [], uv = [];
+      for (let i = 0; i < N; i++) {
+        const w = kerbWidth(i);
+        const a = (hw - 0.12) * side, b = (hw - 0.12 - w) * side;
+        pos.push(px[i] + nx[i] * a, hh[i] + 0.04, pz[i] + nz[i] * a);
+        pos.push(px[i] + nx[i] * b, hh[i] + 0.04, pz[i] + nz[i] * b);
+        uv.push(0, 0, 1, 0);
+        const c = kerbColor(i);
+        col.push(...c, ...c);
+      }
+      for (let i = 0; i < N; i++) {
+        const a = 2 * i, b = 2 * i + 1, c = 2 * ((i + 1) % N), d = 2 * ((i + 1) % N) + 1;
+        idx.push(a, c, b, b, c, d); // wound so the normal points up (shadow bias)
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+      g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+      g.setIndex(idx);
+      g.computeVertexNormals();
+      const m = new THREE.Mesh(g, kerbMat());
+      m.receiveShadow = true;
+      this.addMesh(scene, m);
+    }
 
     // center dashes
     {
@@ -512,7 +579,7 @@ export class Track {
     }
 
     // banked walls — they lean outward so cars slide up and off them.
-    const red = [0.85, 0.24, 0.2], white = [0.94, 0.92, 0.86];
+    const red = [0.78, 0.13, 0.11], white = [0.88, 0.88, 0.84];
     for (const side of [-1, 1]) {
       const pos = [], col = [], idx = [];
       for (let i = 0; i < N; i++) {
@@ -523,15 +590,18 @@ export class Track {
       }
       for (let i = 0; i < N; i++) {
         const a = 2 * i, b = 2 * i + 1, c = 2 * ((i + 1) % N), d = 2 * ((i + 1) % N) + 1;
-        if (side > 0) idx.push(a, b, c, b, d, c);
-        else idx.push(a, c, b, b, c, d);
+        if (side > 0) idx.push(a, c, b, b, c, d);
+        else idx.push(a, b, c, b, d, c);
       }
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
       g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
       g.setIndex(idx);
       g.computeVertexNormals();
-      this.addMesh(scene, new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+      const wall = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.75, metalness: 0.05, envMapIntensity: 0.3 }));
+      wall.castShadow = true;
+      wall.receiveShadow = true;
+      this.addMesh(scene, wall);
     }
 
     // start/finish checker strip
@@ -561,16 +631,8 @@ export class Track {
       this.addMesh(scene, new THREE.Mesh(g, decal({ vertexColors: true })));
     }
 
-    // ground
-    {
-      const g = new THREE.PlaneGeometry(1400, 1400);
-      g.rotateX(-Math.PI / 2);
-      const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: 0x22301f }));
-      m.position.y = -0.08;
-      this.addMesh(scene, m);
-    }
-
-    // glowing boost pads — alternating yellow/orange full-width bands
+    // glowing boost pads — alternating yellow/orange full-width bands (pulsed in update)
+    this.padMats = [];
     {
       for (const p of this.padsWorld) {
         const pos = [], col = [], idx = [];
@@ -598,57 +660,73 @@ export class Track {
         g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
         g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
         g.setIndex(idx);
-        this.addMesh(scene, new THREE.Mesh(g, decal({ vertexColors: true })));
+        const pm = decal({ vertexColors: true });
+        this.padMats.push(pm);
+        this.addMesh(scene, new THREE.Mesh(g, pm));
       }
     }
 
-    // start/finish banner arch
+    // start/finish gantry: posts, checkered beam, five start lights
+    this.startLightMats = [];
     {
       const s0 = this.poseFor(0, 0);
       const n0x = Math.cos(s0.heading), n0z = -Math.sin(s0.heading);
-      const postGeo = new THREE.CylinderGeometry(0.3, 0.35, 5.6, 8);
-      const postMat = new THREE.MeshLambertMaterial({ color: 0xe8ecf2 });
+      const postGeo = new THREE.CylinderGeometry(0.3, 0.38, 6.4, 8);
+      const postMat = new THREE.MeshStandardMaterial({ color: 0xe8ecf2, roughness: 0.5, metalness: 0.3 });
       for (const side of [-1, 1]) {
         const post = new THREE.Mesh(postGeo, postMat);
-        post.position.set(s0.x + n0x * (hw + 1.2) * side, s0.y + 2.8, s0.z + n0z * (hw + 1.2) * side);
+        post.position.set(s0.x + n0x * (hw + 1.2) * side, s0.y + 3.2, s0.z + n0z * (hw + 1.2) * side);
+        post.castShadow = true;
         this.addMesh(scene, post);
       }
+      const checker = makeCheckerTexture(14, 2);
       const beam = new THREE.Mesh(
-        new THREE.BoxGeometry((hw + 1.2) * 2 + 0.6, 1.0, 0.5),
-        new THREE.MeshLambertMaterial({ color: 0x35e0c8 })
+        new THREE.BoxGeometry((hw + 1.2) * 2 + 0.6, 1.1, 0.6),
+        checker ? new THREE.MeshLambertMaterial({ map: checker }) : new THREE.MeshLambertMaterial({ color: 0xffffff })
       );
-      beam.position.set(s0.x, s0.y + 5.6, s0.z);
+      beam.position.set(s0.x, s0.y + 6.4, s0.z);
       beam.rotation.y = s0.heading;
+      beam.castShadow = true;
       this.addMesh(scene, beam);
-    }
-
-    // low-poly pines scattered outside the walls
-    {
-      let seed = 0;
-      for (const ch of this.def.id) seed = seed * 31 + ch.charCodeAt(0) >>> 0;
-      const rng = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
-      const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5a3d24 });
-      const leafMat = new THREE.MeshLambertMaterial({ color: 0x2f6b35 });
-      const count = Math.round(this.length / 36);
-      for (let k = 0; k < count; k++) {
-        const i = Math.floor((k / count) * N + rng() * (N / count));
-        const side = rng() > 0.5 ? 1 : -1;
-        const lat = (hw + 9 + rng() * 18) * side;
-        const x = px[i] + nx[i] * lat, z = pz[i] + nz[i] * lat;
-        const hgt = 3 + rng() * 2.5;
-        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.32, 1.6, 5), trunkMat);
-        trunk.position.set(x, 0.8, z);
-        const cone = new THREE.Mesh(new THREE.ConeGeometry(1.4 + rng() * 0.7, hgt, 6), leafMat);
-        cone.position.set(x, 1.6 + hgt / 2, z);
-        this.addMesh(scene, trunk);
-        this.addMesh(scene, cone);
+      const housing = new THREE.Mesh(new THREE.BoxGeometry(5.4, 0.9, 0.5), new THREE.MeshLambertMaterial({ color: 0x1a1f26 }));
+      housing.position.set(s0.x, s0.y + 5.35, s0.z);
+      housing.rotation.y = s0.heading;
+      this.addMesh(scene, housing);
+      const bulbGeo = new THREE.SphereGeometry(0.3, 10, 8);
+      for (let k = 0; k < 5; k++) {
+        const m = new THREE.MeshStandardMaterial({ color: 0x2a0a0a, emissive: 0xff2020, emissiveIntensity: 0, roughness: 0.3 });
+        const b = new THREE.Mesh(bulbGeo, m);
+        const off = (k - 2) * 1.05;
+        b.position.set(s0.x + n0x * off, s0.y + 5.35, s0.z + n0z * off + 0);
+        // bulbs face backwards along the track so the grid sees them
+        b.position.x -= Math.sin(s0.heading) * 0.3;
+        b.position.z -= Math.cos(s0.heading) * 0.3;
+        this.addMesh(scene, b);
+        this.startLightMats.push(m);
       }
     }
+
+    this.pulseT = 0;
 
     // racing line hint (toggle with L) — wide, bright, lifted and
     // polygon-offset so it actually reads from the chase camera
     this.lineMesh = strip(-0.75, 0.75, 0.075,
       decal({ color: 0x3dff7a, transparent: true, opacity: 0.55 }));
+  }
+
+  // start lights: `lit` red bulbs on, or all green when `go`; -1 = all off
+  setStartLights(lit, go = false) {
+    this.startLightMats.forEach((m, i) => {
+      if (go) { m.emissive.setHex(0x30ff60); m.emissiveIntensity = 2.2; }
+      else { m.emissive.setHex(0xff2020); m.emissiveIntensity = i < lit ? 2.2 : 0; }
+    });
+  }
+
+  // animated bits: boost pads pulse
+  update(dt) {
+    this.pulseT += dt;
+    const k = 0.75 + 0.25 * Math.sin(this.pulseT * 7);
+    for (const m of this.padMats) m.color.setRGB(k, k, k);
   }
 
   // outline points for the HUD minimap

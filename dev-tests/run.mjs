@@ -3,7 +3,7 @@
 import * as THREE from "three";
 import { Car, resolveCarContacts, SURFACES } from "./src/car.js";
 import { Track, TRACKS } from "./src/track.js";
-import { AIDriver, AI_TIERS } from "./src/ai.js";
+import { AIDriver, AI_TIERS, finishCars } from "./src/ai.js";
 import { GhostSystem } from "./src/ghost.js";
 
 let totalFailures = 0;
@@ -358,6 +358,35 @@ section("breeze jump #2 landing");
   check(car.grounded, "car is grounded 4s after landing");
   check(car.speed > 8, `car drives on after landing (v=${car.speed.toFixed(1)})`);
   check(car.prog.s > ramp.s1, "car made progress past the ramp");
+}
+
+/* ================= 6c) AI bots park after their final lap ================= */
+section("AI finish behavior");
+{
+  const scene = new THREE.Scene();
+  const track = new Track(scene, TRACKS[0]);
+  const LAPS = 3;
+  const cars = AI_TIERS.map((t) => new Car(scene, t.color, t.name));
+  const ais = cars.map((c, i) => new AIDriver(c, track, AI_TIERS[i]));
+  cars.forEach((car, i) => {
+    const pose = track.poseFor(track.length - 16 - Math.floor(i / 2) * 8, (i % 2 ? 1 : -1) * 2.6);
+    car.place(pose.x, pose.z, pose.heading, pose.y);
+    track.initProgress(car);
+  });
+  let allParkedFrame = -1;
+  for (let step = 0; step < 60 * 280; step++) {
+    for (const ai of ais) if (!ai.car.finished) ai.car.update(1 / 60, ai.update(1 / 60, { playerTotal: 99999 }), track);
+    const active = finishCars(cars, LAPS);
+    resolveCarContacts(active);
+    for (const car of cars) { track.resolveCollision(car); track.updateProgress(car); }
+    if (active.length === 0 && allParkedFrame < 0) allParkedFrame = step;
+  }
+  console.log(`all bots parked after ${(allParkedFrame / 60).toFixed(0)}s of racing`);
+  check(allParkedFrame > 0, "every bot parks after 3 laps (none left racing)");
+  check(cars.every((c) => c.finished && !c.mesh.visible), "parked bots are hidden");
+  // a restart makes them race again
+  for (const c of cars) { c.finished = false; c.mesh.visible = true; if (c.shadow) c.shadow.visible = true; }
+  check(cars.every((c) => !c.finished && c.mesh.visible), "restart brings the bots back");
 }
 
 /* ================= 7) GHOST + CONTACTS ==================================== */

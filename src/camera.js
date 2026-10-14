@@ -1,4 +1,5 @@
-// camera.js — chase camera with positional lag and drift-aware swing.
+// camera.js — chase camera with positional lag, drift-aware swing, a little
+// roll with the slide, impact shake, and a slow orbit used by the menu.
 import * as THREE from "three";
 
 export class ChaseCam {
@@ -8,6 +9,9 @@ export class ChaseCam {
     this.look = new THREE.Vector3();
     this.fov = 62;
     this.initialized = false;
+    this.shake = 0;     // decaying impact energy
+    this.roll = 0;
+    this.orbitT = 0;
   }
 
   snapTo(car) {
@@ -15,7 +19,10 @@ export class ChaseCam {
     this.pos.set(car.pos.x - fx * 7, car.pos.y + 3, car.pos.z - fz * 7);
     this.look.set(car.pos.x, car.pos.y + 1, car.pos.z);
     this.initialized = true;
+    this.shake = 0;
   }
+
+  kick(amount) { this.shake = Math.min(1.2, this.shake + amount); }
 
   update(dt, car) {
     if (!this.initialized) this.snapTo(car);
@@ -41,15 +48,39 @@ export class ChaseCam {
     this.look.y += (car.pos.y + 1.1 - this.look.y) * kk;
     this.look.z += (lookZ - this.look.z) * kk;
 
-    this.cam.position.copy(this.pos);
+    // impact shake: random jitter that decays fast
+    this.shake *= Math.exp(-7 * dt);
+    const sh = this.shake * 0.35;
+    this.cam.position.set(
+      this.pos.x + (Math.random() - 0.5) * sh,
+      this.pos.y + (Math.random() - 0.5) * sh,
+      this.pos.z + (Math.random() - 0.5) * sh,
+    );
     this.cam.lookAt(this.look);
+    // roll with the slide + a touch of speed shimmer
+    const rollT = -swing * 0.06 + (Math.random() - 0.5) * this.shake * 0.04;
+    this.roll += (rollT - this.roll) * Math.min(1, 6 * dt);
+    this.cam.rotateZ(this.roll);
 
-    // speed-based FOV kick
-    const targetFov = 62 + Math.min(car.speed / 40, 1) * 16;
+    // speed-based FOV kick (boost pushes it wider)
+    const targetFov = 62 + Math.min(car.speed / 40, 1) * 16 + (car.boostFlash > 0.3 ? 6 : 0);
     if (Math.abs(targetFov - this.fov) > 0.05) {
       this.fov += (targetFov - this.fov) * Math.min(1, 5 * dt);
       this.cam.fov = this.fov;
       this.cam.updateProjectionMatrix();
     }
+  }
+
+  // menu: slow orbit around a point on the track, looking along it
+  orbit(dt, track) {
+    this.orbitT += dt;
+    const s = (this.orbitT * 9) % track.length;
+    const p = track.poseFor(s, 0);
+    const ahead = track.poseFor(s + 30, 0);
+    const a = this.orbitT * 0.25;
+    this.cam.position.set(p.x + Math.sin(a) * 22, p.y + 9 + Math.sin(this.orbitT * 0.4) * 2, p.z + Math.cos(a) * 22);
+    this.cam.lookAt(ahead.x, ahead.y + 1, ahead.z);
+    if (Math.abs(this.cam.fov - 55) > 0.1) { this.cam.fov = 55; this.fov = 55; this.cam.updateProjectionMatrix(); }
+    this.initialized = false; // next race snaps cleanly
   }
 }
