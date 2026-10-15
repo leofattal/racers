@@ -8,17 +8,38 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 
-export const CAR_MODEL_URL = "https://cdn.jsdelivr.net/gh/mrdoob/three.js@r148/examples/models/gltf/ferrari.glb";
+// mirrors of the same file, tried in order with a timeout each: a CDN that
+// hangs must not cost the game its cars
+export const CAR_MODEL_URLS = [
+  "https://threejs.org/examples/models/gltf/ferrari.glb",
+  "https://raw.githubusercontent.com/mrdoob/three.js/r148/examples/models/gltf/ferrari.glb",
+  "https://cdn.jsdelivr.net/gh/mrdoob/three.js@r148/examples/models/gltf/ferrari.glb",
+];
+export const CAR_MODEL_URL = CAR_MODEL_URLS[0];
+const FETCH_TIMEOUT_MS = 12000;
 const DRACO_PATH = "https://unpkg.com/three@0.148.0/examples/jsm/libs/draco/gltf/";
 const TARGET_LENGTH = 3.3; // metres, matches the physics footprint
 
-export function loadCarModel(url = CAR_MODEL_URL) {
+// fetch the first mirror that answers in time, then parse the binary glTF
+async function fetchFirst(urls) {
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), mode: "cors" });
+      if (!res.ok) throw new Error(`${res.status} ${url}`);
+      return { buffer: await res.arrayBuffer(), url };
+    } catch (e) { lastErr = e; console.warn("car model mirror failed:", url, e && e.message); }
+  }
+  throw lastErr || new Error("no car model mirror reachable");
+}
+
+export function loadCarModel(urls = CAR_MODEL_URLS) {
   return new Promise((resolve, reject) => {
     const draco = new DRACOLoader();
     draco.setDecoderPath(DRACO_PATH);
     const loader = new GLTFLoader();
     loader.setDRACOLoader(draco);
-    loader.load(url, (gltf) => {
+    fetchFirst(typeof urls === "string" ? [urls] : urls).then(({ buffer, url }) => loader.parse(buffer, url.slice(0, url.lastIndexOf("/") + 1), (gltf) => {
       const root = gltf.scene.children[0] || gltf.scene;
       // orient: nose toward +z (our forward), scale to the physics length,
       // rest on y = 0
@@ -42,7 +63,7 @@ export function loadCarModel(url = CAR_MODEL_URL) {
       wrap.updateMatrixWorld(true);
       wrap.userData.bounds = new THREE.Box3().setFromObject(wrap);
       resolve(wrap);
-    }, undefined, reject);
+    }, reject)).catch(reject);
   });
 }
 
