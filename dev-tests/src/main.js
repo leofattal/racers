@@ -17,6 +17,7 @@ import { Environment, makeLabel } from "./env.js";
 import { loadCarModel, applyCarModel } from "./models.js";
 import { NetHost, NetClient, netAvailable, packCar, unpackCar, applyRemote, stepRemote, MAX_PLAYERS } from "./net.js";
 import { loadMem, saveMem } from "./memory.js";
+import { Inline3D } from "./xr.js";
 
 // --- settings (persisted) ---------------------------------------------------
 const DIFFICULTY = { easy: 0.9, normal: 1.0, hard: 1.14 };
@@ -40,6 +41,8 @@ renderer.toneMappingExposure = 0.92;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
+// glasses-free stereo on a DisplayXR display; inert (no download) elsewhere
+const stereo = new Inline3D();
 
 // --- world ------------------------------------------------------------------
 let track = null;
@@ -115,6 +118,7 @@ window.addEventListener("keydown", () => audio.ensure(), { once: false });
 window.addEventListener("pointerdown", () => audio.ensure(), { once: false });
 
 function resize() {
+  if (stereo.woven) { stereo.resize(); return; } // the side-by-side store is sized there
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h);
   for (const v of views) {
@@ -189,6 +193,7 @@ function applySettings() {
     : `<b>WASD</b> drive &nbsp; <b>Space</b> handbrake &nbsp; <b>R</b> reset &nbsp; <b>Esc</b> pause`);
   views[1].hud.setHint(`<b>Arrows</b> drive &nbsp; <b>Right Shift</b> handbrake &nbsp; <b>Backspace</b> reset &nbsp; or gamepad`);
   resize();
+  syncStereo();
 }
 
 function placeOnGrid() {
@@ -644,15 +649,20 @@ function liveStandings() {
   return [...finishOrder, ...rest];
 }
 
+// the single full-screen view: aim the shadow frustum, return its camera
+function focusView0() {
+  const v = views[0];
+  env.setFocus(state === "menu" || state === "lobby" ? v.camera.position : v.player.car.pos);
+  return v.camera;
+}
+
 // one viewport per local screen (top/bottom in split-screen)
 function renderViews() {
   const w = window.innerWidth, h = window.innerHeight;
   if (locals.length !== 2 || state === "menu" || state === "lobby") {
     renderer.setScissorTest(false);
     renderer.setViewport(0, 0, w, h);
-    const v = views[0];
-    env.setFocus(state === "menu" || state === "lobby" ? v.camera.position : v.player.car.pos);
-    renderer.render(scene, v.camera);
+    renderer.render(scene, focusView0());
     return;
   }
   renderer.setScissorTest(true);
@@ -682,20 +692,41 @@ let last = performance.now();
 let lastFrameAt = performance.now();
 let frameCount = 0;
 // read-only debug readout (useful from the console / automated checks)
-window.__drift = { get state() { return state; }, get mode() { return mode; }, get raceTime() { return raceTime; }, get countdown() { return countdownT; }, get frames() { return frameCount; } };
+window.__drift = { get state() { return state; }, get mode() { return mode; }, get raceTime() { return raceTime; }, get countdown() { return countdownT; }, get frames() { return frameCount; },
+  xr: { get available() { return stereo.available; }, get woven() { return stereo.woven; }, get scale() { return stereo.scale; }, get firstWoven() { return stereo.firstWoven; } } };
+
+// the 2D loop; it stands down while the DisplayXR session drives frames
+let monoLoop = true;
 function frame(now) {
-  if (now - lastFrameAt < 4) return; // timer and rAF both fired: skip the duplicate
+  if (!monoLoop) return;
+  requestAnimationFrame(frame); // always re-arm first: a skipped duplicate must not end the chain
+  if (isDuplicate(now)) return; // timer and rAF both fired: skip the duplicate
+  if (step(now)) renderViews();
+}
+function startMonoLoop() {
+  if (monoLoop) return;
+  monoLoop = true;
+  requestAnimationFrame(frame);
+}
+// A rAF timestamp is the frame's START, so it can be earlier than a
+// performance.now() taken by a task in between (the boot code, the stall
+// timer, the woven loop). Treating "earlier" as a duplicate ended the chain
+// for good — seen in headless Chrome, where the menu never got a frame. Only
+// a near-equal stamp is a duplicate; an earlier one just yields dt <= 0.
+const isDuplicate = (now) => Math.abs(now - lastFrameAt) < 4;
+
+// one simulation step; false when there is nothing new to draw
+function step(now) {
+  if (isDuplicate(now)) return false;
   lastFrameAt = now;
   frameCount++;
-  requestAnimationFrame(frame);
   let dt = Math.min((now - last) / 1000, 0.05);
   last = now;
-  if (dt <= 0) return;
+  if (dt <= 0) return false;
 
   if (state === "paused") {
     // frozen world: same frame re-rendered, sim and timers halted
-    renderViews();
-    return;
+    return true;
   }
 
   if (state === "menu" || state === "lobby") {
@@ -708,8 +739,7 @@ function frame(now) {
     track.update(dt);
     views[0].cam.orbit(dt, track);
     env.update(dt);
-    renderViews();
-    return;
+    return true;
   }
 
   const idle = { steer: 0, throttle: 0, brake: 0, handbrake: false };
@@ -845,8 +875,7 @@ function frame(now) {
     ...humans.filter((p) => !locals.some((l) => l.player === p) && p.car.mesh.visible).map((p) => ({ x: p.car.pos.x, z: p.car.pos.z, color: colorHex(p.car.color), r: 3.5 })),
     ...locals.map((l) => ({ x: l.player.car.pos.x, z: l.player.car.pos.z, color: l.view.slot === 0 ? "#ffffff" : colorHex(l.player.car.color), r: 4, ring: true })),
   ]);
-
-  renderViews();
+  return true;
 }
 
 // guest's frame: local prediction for own car, puppets for the rest
@@ -885,5 +914,45 @@ function clientFrame(dt, myInput) {
 requestAnimationFrame(frame);
 // browsers stop or throttle animation frames in hidden/background tabs; a
 // host must keep simulating and sending snapshots for everyone else, so
-// tick on a timer whenever frames have stalled
-setInterval(() => { if (isOnline() && performance.now() - lastFrameAt > 90) frame(performance.now()); }, 1000 / 30);
+// tick on a timer whenever frames have stalled. While woven this only
+// simulates: a second painter over the side-by-side buffer corrupts it.
+setInterval(() => {
+  if (!isOnline() || performance.now() - lastFrameAt <= 90) return;
+  const now = performance.now();
+  if (stereo.woven) step(now);
+  else if (step(now)) renderViews(); // never through frame(): that would start a second rAF chain
+}, 1000 / 30);
+
+// --- DisplayXR stereo ----------------------------------------------------------
+// Split-screen is two viewports in one canvas and cannot be woven, so stereo
+// runs only with one local view (single player and online). The menu orbit is
+// woven too.
+function stereoConvergence() {
+  // where the eye should rest sits on the glass: the car in a race, the
+  // orbit's radius in the menu (both well past the comfort floor)
+  if (state === "menu" || state === "lobby" || !views[0].player) return 22;
+  return views[0].camera.position.distanceTo(views[0].player.car.pos);
+}
+function syncStereo() {
+  const want = stereo.available && locals.length !== 2;
+  if (want && !stereo.woven) {
+    const ok = stereo.start({
+      renderer, scene, THREE, canvas,
+      getCamera: () => views[0].camera,
+      getConvergence: stereoConvergence,
+      simulate: (now) => { step(now); focusView0(); },
+      renderMono: renderViews,
+      onStop: () => { resize(); startMonoLoop(); },
+      overlays: [
+        document.getElementById("hud-map"), document.getElementById("hud-track"),
+        document.getElementById("menu"), ...document.querySelectorAll(".panel"),
+        ...document.querySelectorAll(".player-hud .hud:not(.vignette):not(.boost-glow)"),
+      ],
+    });
+    // only now: a refused activation must leave the 2D loop running
+    if (ok) monoLoop = false;
+  } else if (!want && stereo.woven) {
+    stereo.stop();
+  }
+}
+stereo.init().then(syncStereo);

@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- the game weaves its own canvas (src/xr.js); the browser's auto-3D shim must not convert it too -->
+<meta name="displayxr-auto3d" content="off">
 <title>Drift Circuit</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
@@ -90,8 +92,9 @@
   #hud-track { left: 50%; transform: translateX(-50%); bottom: 26px; font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #8fa5bd; text-shadow: 0 1px 3px #000; }
 
   .panel { top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 15;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
-    padding: 28px 44px; text-align: center; display: none; backdrop-filter: blur(6px); }
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 28px 44px; text-align: center; display: none;
+    background: rgba(8, 12, 18, .92); /* near-solid, no backdrop-filter: a blur over a woven canvas smears the weave */ }
   .panel h1 { margin: 0 0 14px; font-size: 36px; color: var(--accent); letter-spacing: 4px; }
   .btn { display: block; width: 100%; margin: 10px 0; padding: 12px 26px; font-family: inherit;
     font-size: 16px; font-weight: 700; letter-spacing: 2px; color: #fff; background: #1c2c3e;
@@ -153,6 +156,18 @@
   #lobby-players .row .car { font-size: 12px; letter-spacing: 2px; color: #cfe0f2; }
   #lobby-note { font-size: 12px; color: #8fa5bd; margin: 6px 0 4px; letter-spacing: 1px; line-height: 1.6; }
   @media (max-width: 900px) { #tracks { grid-template-columns: repeat(3, 1fr); } }
+
+  /* ---- DisplayXR stereo (src/xr.js) ----
+     While the canvas is woven, nothing full-bleed may sit on it: an element
+     congruent with the canvas takes the canvas's place in the weave and the
+     screen shows the raw side-by-side pair. The 2D game never sees these rules. */
+  body.xr-woven .player-hud:not([hidden]) { display: contents; } /* children keep the viewport as their box */
+  body.xr-woven .vignette, body.xr-woven .boost-glow { display: none; }
+  body.xr-woven #menu { inset: auto; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(1040px, 94vw); max-height: calc(100% - 24px); background: none; } /* never the canvas's own box */
+  body.xr-woven #menu .inner { position: static; transform: none; width: auto; }
+  /* hides the canvas until the browser has joined it (a hard cut, never a fade) */
+  #xr-cover { position: fixed; inset: 0; z-index: 1; display: none; background: #0b0e13; }
 </style>
 <!-- Import map: pins three, and versions every local module so browsers never
      mix cached old files with new ones. Bump the ?v= value when src/ changes. -->
@@ -161,26 +176,28 @@
   "imports": {
     "three": "https://unpkg.com/three@0.148.0/build/three.module.js",
     "three/addons/": "https://unpkg.com/three@0.148.0/examples/jsm/",
-    "./src/main.js": "./src/main.js?v=20261015c",
-    "./src/car.js": "./src/car.js?v=20261015c",
-    "./src/track.js": "./src/track.js?v=20261015c",
-    "./src/ai.js": "./src/ai.js?v=20261015c",
-    "./src/hud.js": "./src/hud.js?v=20261015c",
-    "./src/env.js": "./src/env.js?v=20261015c",
-    "./src/audio.js": "./src/audio.js?v=20261015c",
-    "./src/input.js": "./src/input.js?v=20261015c",
-    "./src/camera.js": "./src/camera.js?v=20261015c",
-    "./src/ghost.js": "./src/ghost.js?v=20261015c",
-    "./src/particles.js": "./src/particles.js?v=20261015c",
-    "./src/skidmarks.js": "./src/skidmarks.js?v=20261015c",
-    "./src/memory.js": "./src/memory.js?v=20261015c",
-    "./src/models.js": "./src/models.js?v=20261015c"
+    "./src/main.js": "./src/main.js?v=20261016a",
+    "./src/car.js": "./src/car.js?v=20261016a",
+    "./src/track.js": "./src/track.js?v=20261016a",
+    "./src/ai.js": "./src/ai.js?v=20261016a",
+    "./src/hud.js": "./src/hud.js?v=20261016a",
+    "./src/env.js": "./src/env.js?v=20261016a",
+    "./src/audio.js": "./src/audio.js?v=20261016a",
+    "./src/input.js": "./src/input.js?v=20261016a",
+    "./src/camera.js": "./src/camera.js?v=20261016a",
+    "./src/ghost.js": "./src/ghost.js?v=20261016a",
+    "./src/particles.js": "./src/particles.js?v=20261016a",
+    "./src/skidmarks.js": "./src/skidmarks.js?v=20261016a",
+    "./src/memory.js": "./src/memory.js?v=20261016a",
+    "./src/models.js": "./src/models.js?v=20261016a",
+    "./src/xr.js": "./src/xr.js?v=20261016a"
   }
 }
 </script>
 </head>
 <body>
 <canvas id="game-canvas"></canvas>
+<div id="xr-cover"></div>
 
 <!-- one copy of this is stamped out per player by hud.js -->
 <template id="player-hud-tpl">
@@ -262,6 +279,6 @@
 
 <!-- PeerJS (WebRTC signalling through its public broker) for online lobbies -->
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script type="module" src="./src/main.js?v=20261015c"></script>
+<script type="module" src="./src/main.js?v=20261016a"></script>
 </body>
 </html>
