@@ -44,6 +44,7 @@ export class NetHost extends Emitter {
   start(code = makeCode()) {
     return new Promise((resolve, reject) => {
       this.code = code;
+      this.pruneTimer = setInterval(() => this.prune(), 2000);
       const peer = this.peer = new window.Peer(PREFIX + code, { debug: 1 });
       const fail = (err) => { this.destroy(); reject(err); };
       peer.on("open", () => { this.open = true; resolve(code); });
@@ -61,6 +62,7 @@ export class NetHost extends Emitter {
       if (this.guests.size >= MAX_PLAYERS - 1) { conn.send({ t: "kick", reason: "lobby full" }); setTimeout(() => conn.close(), 200); return; }
       const g = { conn, name: "GUEST", car: "balanced", slot: this._freeSlot(), input: null, lastSeen: performance.now() };
       this.guests.set(id, g);
+      conn.send({ t: "you", slot: g.slot }); // first thing a guest learns: which seat is theirs
       this.emit("join", id, g);
     });
     conn.on("data", (m) => {
@@ -68,15 +70,47 @@ export class NetHost extends Emitter {
       if (!g || !m || typeof m !== "object") return;
       g.lastSeen = performance.now();
       switch (m.t) {
-        case "hello": g.name = String(m.name || "GUEST").slice(0, 10).toUpperCase() || "GUEST"; g.car = m.car || "balanced"; this.emit("lobbyChange"); break;
+        case "hello":
+          g.name = String(m.name || "GUEST").slice(0, 10).toUpperCase() || "GUEST"; g.car = m.car || "balanced";
+          // a refreshed guest comes back under a new peer id before the old
+          // connection times out: drop the dead twin so its seat frees up
+          for (const [oid, og] of this.guests) if (oid !== id && og.name === g.name && this._isDead(og)) this._drop(oid, "stale twin");
+          this.emit("lobbyChange");
+          break;
+        case "ping": break;
         case "car": g.car = m.car || "balanced"; this.emit("lobbyChange"); break;
         case "input": g.input = { steer: +m.s || 0, throttle: +m.g || 0, brake: +m.b || 0, handbrake: !!m.h }; break;
         case "reset": this.emit("reset", id); break;
       }
     });
-    const gone = () => { if (this.guests.delete(id)) this.emit("leave", id); };
-    conn.on("close", gone);
-    conn.on("error", gone);
+    conn.on("close", () => this._drop(id, "closed"));
+    conn.on("error", (e) => this._drop(id, "error: " + (e && (e.type || e.message) || e)));
+  }
+
+  _drop(id, reason = "") {
+    const g = this.guests.get(id);
+    if (!g) return;
+    console.warn(`[net] dropping ${g.name} (slot ${g.slot}): ${reason}`);
+    this.guests.delete(id);
+    try { g.conn.close(); } catch (e) { /* noop */ }
+    this.emit("leave", id);
+  }
+
+  // liveness comes from the transport, never from message cadence: a guest in
+  // a background tab sends nothing for a long time and is still connected
+  _isDead(g) {
+    if (!g.conn.open) return true;
+    const pc = g.conn.peerConnection;
+    const ice = pc ? pc.iceConnectionState : "connected";
+    if (ice === "failed" || ice === "closed") return true;
+    if (ice === "disconnected") { g.disconnectedSince = g.disconnectedSince || performance.now(); return performance.now() - g.disconnectedSince > 10000; }
+    g.disconnectedSince = null;
+    return false;
+  }
+
+  // dead links (closed laptop, lost network) are pruned so their seat frees up
+  prune() {
+    for (const [id, g] of [...this.guests]) if (this._isDead(g)) this._drop(id, `dead link (${g.conn.open ? g.conn.peerConnection?.iceConnectionState : "channel closed"})`);
   }
 
   _freeSlot() {
@@ -89,6 +123,7 @@ export class NetHost extends Emitter {
   broadcast(msg) { for (const g of this.guests.values()) if (g.conn.open) g.conn.send(msg); }
 
   destroy() {
+    clearInterval(this.pruneTimer);
     for (const g of this.guests.values()) { try { g.conn.close(); } catch (e) { /* noop */ } }
     this.guests.clear();
     if (this.peer) { try { this.peer.destroy(); } catch (e) { /* noop */ } }
@@ -111,6 +146,7 @@ export class NetClient extends Emitter {
   join(code, name, car) {
     return new Promise((resolve, reject) => {
       this.code = code.toUpperCase().trim();
+      this.mySlot = null;
       const peer = this.peer = new window.Peer(undefined, { debug: 1 });
       let settled = false;
       const fail = (err) => { if (settled) return; settled = true; this.destroy(); reject(err); };
@@ -123,9 +159,16 @@ export class NetClient extends Emitter {
           settled = true;
           this.connected = true;
           conn.send({ t: "hello", name, car });
+          this.pingTimer = setInterval(() => this.send({ t: "ping" }), 1500);
           resolve();
         });
-        conn.on("data", (m) => { if (m && typeof m === "object") this.emit("msg", m); });
+        // the seat assignment is handled here so it is never lost to handler
+        // ordering: it arrives before the lobby roster and before any start
+        conn.on("data", (m) => {
+          if (!m || typeof m !== "object") return;
+          if (m.t === "you") this.mySlot = m.slot;
+          this.emit("msg", m);
+        });
         const gone = () => { const was = this.connected; this.connected = false; if (was) this.emit("disconnect"); else fail(new Error("could not reach host")); };
         conn.on("close", gone);
         conn.on("error", gone);
@@ -140,6 +183,7 @@ export class NetClient extends Emitter {
   }
 
   destroy() {
+    clearInterval(this.pingTimer);
     if (this.conn) { try { this.conn.close(); } catch (e) { /* noop */ } }
     if (this.peer) { try { this.peer.destroy(); } catch (e) { /* noop */ } }
     this.conn = null;

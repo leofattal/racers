@@ -5,6 +5,8 @@ import { Car, resolveCarContacts, SURFACES } from "./src/car.js";
 import { Track, TRACKS, makeRandomTrack, trackDefIsSane, randomTrackDef } from "./src/track.js";
 import { AIDriver, AI_TIERS, finishCars } from "./src/ai.js";
 import { GhostSystem } from "./src/ghost.js";
+import { Hazards, buildSchedule, HAZARD_TUNING } from "./src/hazards.js";
+import { readFileSync } from "node:fs";
 
 let totalFailures = 0;
 const section = (name) => console.log(`\n=== ${name} ===`);
@@ -552,6 +554,154 @@ section("ghost + contacts");
   const aDefl = Math.abs(a.vel.x), bDefl = Math.abs(b.vel.x);
   console.log(`sep=${sep.toFixed(2)} deflA=${aDefl.toFixed(1)} deflB=${bDefl.toFixed(1)}`);
   check(sep > 2.5 && aDefl > 0.5 && bDefl > 0.5, "contacts: separate + impulses");
+}
+
+/* ================= 7b) HAZARDS (earthquake / eruption) ===================== */
+section("hazards");
+{
+  const scene = new THREE.Scene();
+  const dt = 1 / 60;
+  const mkLog = () => ({ t: 0, kicks: 0, flashes: [], sfx: [], bursts: 0, puffs: 0 });
+  const mkCtx = (log) => ({
+    kickCams: (a) => { log.kicks += a; },
+    flash: (text) => { log.flashes.push([log.t, text]); },
+    sfx: (name) => { log.sfx.push([log.t, name]); },
+    particles: { burst() { log.bursts++; }, puff() { log.puffs++; } },
+  });
+  const park = (track, car, s) => {
+    const p = track.poseFor(s, 0);
+    car.place(p.x, p.z, p.heading, p.y);
+    track.initProgress(car);
+  };
+  const latOff = (track, x, z) => {
+    const i = track.indexOf(x, z);
+    return (x - track.px[i]) * track.nx[i] + (z - track.pz[i]) * track.nz[i];
+  };
+  check(!/Math\.random\s*\(/.test(readFileSync(new URL("./src/hazards.js", import.meta.url), "utf8")), "hazards: no Math.random");
+
+  // --- eruption on RAINBOW RIDGE ---
+  {
+    const track = new Track(scene, TRACKS[3]);
+    const car = new Car(scene, 0x39a0ff, "PARKED");
+    const S0 = 100;
+    park(track, car, S0);
+    const hz = new Hazards(scene);
+    hz.setTrack(track, true);
+    check(hz.type === "eruption", "hazards: rainbow -> eruption");
+    const ev = hz.schedule[0];
+    check(ev.t >= 24.5 && ev.t <= 26.5, `hazards: first eruption at ~25 s (${ev.t.toFixed(2)})`);
+    check(ev.rocks.length >= 6 && ev.rocks.length <= 10, "hazards: 6-10 rocks");
+    const log = mkLog(), ctx = mkCtx(log);
+    let warnAt = null, activeAt = null, landed = new Map(), maxAlive = 0;
+    for (let t = 0; t < ev.t + 6.5; t += dt) {
+      log.t = t;
+      hz.update(dt, t, [car], ctx);
+      if (hz.warning && warnAt === null) warnAt = t;
+      if (hz.active && activeAt === null) activeAt = t;
+      let alive = 0;
+      for (const r of hz.rocks) if (r.alive) { alive++; if (r.landed && !landed.has(r.k)) landed.set(r.k, { s: r.s, x: r.x, z: r.z }); }
+      maxAlive = Math.max(maxAlive, alive);
+    }
+    const okAhead = [...landed.values()].every((r) => { const a = ((r.s - S0) % track.length + track.length) % track.length; return a >= 60 - 1 && a <= 220 + 1; });
+    const okLat = [...landed.values()].every((r) => Math.abs(latOff(track, r.x, r.z)) <= 6);
+    console.log(`eruption t=${ev.t.toFixed(2)} warn@${warnAt && warnAt.toFixed(2)} active@${activeAt && activeAt.toFixed(2)} rocks=${ev.rocks.length} landed=${landed.size} bursts=${log.bursts} puffs=${log.puffs}`);
+    check(warnAt !== null && Math.abs(warnAt - (ev.t - 3)) < 0.05, "hazards: warning 3 s ahead");
+    check(log.flashes.some(([t, m]) => m === "ERUPTION INCOMING" && t < ev.t), "hazards: ERUPTION INCOMING flash");
+    check(log.flashes.some(([t, m]) => m === "ERUPTION" && t >= ev.t), "hazards: ERUPTION flash");
+    check(log.sfx.some(([t, n]) => n === "rumble-warn" && t < ev.t) && log.sfx.some(([t, n]) => n === "quake" && t >= ev.t), "hazards: warning + quake audio");
+    check(activeAt !== null && Math.abs(activeAt - ev.t) < 0.05, "hazards: eruption fires on schedule");
+    check(landed.size === ev.rocks.length && maxAlive <= 12, "hazards: every rock lands");
+    check(okAhead, "hazards: rocks 60-220 m ahead of the leader");
+    check(okLat, "hazards: rocks on the road (|lat| <= 6)");
+    check(log.bursts > 20 && log.puffs >= ev.rocks.length, "hazards: rock trails + dust");
+    check(car.speed === 0 && !car.wallHit, "hazards: eruption leaves a distant parked car alone");
+
+    // drive a car into a landed rock
+    const tHit = ev.t + 6.5;
+    const rock = hz.rocks.find((r) => r.alive && r.landed);
+    const victim = new Car(scene, 0xff4fa3, "VICTIM");
+    park(track, victim, rock.s);
+    victim.pos.set(rock.x + 0.6, rock.y, rock.z);
+    victim.vel.set(-6, 0, 10);
+    const v0 = victim.speed;
+    hz.update(dt, tHit, [victim], ctx);
+    const d = Math.hypot(victim.pos.x - rock.x, victim.pos.z - rock.z);
+    console.log(`rock hit: speed ${v0.toFixed(1)} -> ${victim.speed.toFixed(1)} sep=${d.toFixed(2)} wallHit=${victim.wallHit}`);
+    check(victim.wallHit && victim.speed <= v0 * HAZARD_TUNING.HIT_SLOW + 1e-6 && d >= 1.69, "hazards: rock hit slows, flags wallHit, pushes out");
+    const air = new Car(scene, 0xffd34d, "AIR");
+    park(track, air, rock.s);
+    air.pos.set(rock.x + 0.6, rock.y, rock.z); air.vel.set(-6, 0, 10); air.grounded = false;
+    hz.update(dt, tHit + dt, [air], ctx);
+    check(!air.wallHit && air.speed > v0 - 1e-6, "hazards: airborne car clears a rock");
+
+    // rocks cool down and vanish
+    for (let t = tHit; t < ev.t + 16; t += dt) hz.update(dt, t, [car], ctx);
+    check(hz.rocks.every((r) => !r.alive && !r.mesh.visible), "hazards: rocks sink and disappear");
+  }
+
+  // --- earthquake on APEX ---
+  {
+    const track = new Track(scene, TRACKS[0]);
+    const car = new Car(scene, 0x39a0ff, "QUAKE");
+    park(track, car, 100);
+    const h0 = car.heading;
+    const hz = new Hazards(scene);
+    hz.setTrack(track, true);
+    check(hz.type === "earthquake", "hazards: apex -> earthquake");
+    const ev = hz.schedule[0];
+    check(ev.t >= 24.5 && ev.t <= 26.5 && ev.dur >= 4 && ev.dur <= 5, `hazards: tremor at ~25 s for 4-5 s (${ev.t.toFixed(2)}, ${ev.dur.toFixed(2)})`);
+    const log = mkLog(), ctx = mkCtx(log);
+    let preMove = 0, maxLat = 0, kicksBefore = 0, maxInt = 0, intAtEdge = 1;
+    for (let t = 0; t < ev.t + ev.dur + 1; t += dt) {
+      log.t = t;
+      if (t < ev.t - dt) { hz.update(dt, t, [car], ctx); preMove = Math.max(preMove, car.speed); kicksBefore = log.kicks; continue; }
+      car.vel.set(0, 0, 0); // measure each frame's jolt in isolation
+      hz.update(dt, t, [car], ctx);
+      maxLat = Math.max(maxLat, car.speed / dt); // equivalent acceleration
+      if (hz.active) { maxInt = Math.max(maxInt, hz.active.intensity); if (t - ev.t < 0.1) intAtEdge = Math.min(intAtEdge, hz.active.intensity); }
+    }
+    console.log(`earthquake t=${ev.t.toFixed(2)} dur=${ev.dur.toFixed(2)} peak accel=${maxLat.toFixed(2)} m/s^2 heading drift=${(car.heading - h0).toFixed(3)} kicks=${log.kicks.toFixed(2)} dust=${log.bursts}`);
+    check(preMove === 0, "hazards: no jolts before the event");
+    check(maxLat >= 2.5 && maxLat <= 6.5, "hazards: earthquake jolts a grounded car (~3-5 m/s^2)");
+    check(maxInt > 0.95 && intAtEdge < 0.2, "hazards: intensity peaks mid-event");
+    check(log.kicks > kicksBefore + 0.5 && log.bursts > 10, "hazards: camera shake + dust");
+    check(log.flashes.some(([t, m]) => m === "TREMOR INCOMING" && t < ev.t) && log.flashes.some(([t, m]) => m === "EARTHQUAKE" && t >= ev.t), "hazards: tremor HUD flashes");
+    // airborne and finished cars are left alone
+    const flyer = new Car(scene, 0xff4fa3, "FLY"); park(track, flyer, 300); flyer.grounded = false;
+    const done = new Car(scene, 0xffd34d, "DONE"); park(track, done, 400); done.finished = true;
+    hz.update(dt, ev.t + ev.dur / 2, [flyer, done], ctx);
+    check(flyer.speed === 0 && done.speed === 0, "hazards: skips airborne / finished cars");
+  }
+
+  // --- determinism + schedule spacing ---
+  {
+    const track = new Track(null, TRACKS[1], false);
+    const a = new Hazards(null), b = new Hazards(null);
+    a.setTrack(track, true); b.setTrack(track, true);
+    check(JSON.stringify(a.schedule) === JSON.stringify(b.schedule), "hazards: same seed -> identical schedule");
+    check(JSON.stringify(buildSchedule("rainbow", "eruption")) === JSON.stringify(buildSchedule("rainbow", "eruption")), "hazards: eruption schedule deterministic");
+    check(JSON.stringify(buildSchedule("apex", "earthquake")) !== JSON.stringify(buildSchedule("skyway", "earthquake")), "hazards: tracks differ");
+    let gapsOk = true;
+    for (let i = 1; i < a.schedule.length; i++) { const g = a.schedule[i].t - a.schedule[i - 1].t; if (g < 40 || g > 55) gapsOk = false; }
+    check(gapsOk, "hazards: events every 40-55 s");
+    // a random track with the rainbow palette erupts
+    const rnd = new Hazards(null);
+    rnd.setTrack({ id: "random-123", def: { id: "random-123", palette: "rainbow" }, poseFor: () => ({ x: 0, y: 0, z: 0, s: 0 }) }, true);
+    check(rnd.type === "eruption", "hazards: rainbow-palette random track -> eruption");
+  }
+
+  // --- disabled: nothing happens ---
+  {
+    const track = new Track(scene, TRACKS[0]);
+    const car = new Car(scene, 0x39a0ff, "OFF");
+    park(track, car, 100);
+    const hz = new Hazards(scene);
+    hz.setTrack(track, false);
+    const log = mkLog(), ctx = mkCtx(log);
+    let any = false;
+    for (let t = 0; t < 140; t += dt) { hz.update(dt, t, [car], ctx); if (hz.active || hz.warning) any = true; }
+    check(!any && log.flashes.length === 0 && log.sfx.length === 0 && log.kicks === 0 && car.speed === 0 && hz.schedule.length === 0, "hazards: disabled = no events");
+  }
 }
 
 /* ================= 8) PERF ================================================ */

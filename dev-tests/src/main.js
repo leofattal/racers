@@ -18,6 +18,7 @@ import { loadCarModel, applyCarModel } from "./models.js";
 import { NetHost, NetClient, netAvailable, packCar, unpackCar, applyRemote, stepRemote, MAX_PLAYERS } from "./net.js";
 import { loadMem, saveMem } from "./memory.js";
 import { Inline3D } from "./xr.js";
+import { Hazards } from "./hazards.js";
 
 // --- settings (persisted) ---------------------------------------------------
 const DIFFICULTY = { easy: 0.9, normal: 1.0, hard: 1.14 };
@@ -28,6 +29,8 @@ let numPlayers = loadMem("players", 1) === 2 ? 2 : 1;
 let carChoice = loadMem("cars", ["balanced", "balanced"]);
 if (!Array.isArray(carChoice) || carChoice.length !== 2) carChoice = ["balanced", "balanced"];
 let myName = String(loadMem("name", "") || "").toUpperCase().slice(0, 10);
+let hazardsOn = loadMem("hazards", true) !== false; // local setting (host / local races)
+let hostHazards = true;      // online guest: the host's choice, from its "start" message
 const classById = (id) => CAR_CLASSES.find((c) => c.id === id) || CAR_CLASSES[0];
 
 // --- renderer / scene -------------------------------------------------------
@@ -53,6 +56,9 @@ const audio = new AudioSys();
 const ghost = new GhostSystem(scene);
 const particles = new Particles(scene);
 const skids = new SkidMarks(scene);
+const hazards = new Hazards(scene);
+const ERUPT_TINT = new THREE.Color(0xff3a10);
+let sunTinted = false;
 const colorHex = (c) => "#" + c.toString(16).padStart(6, "0");
 
 // a human seat: car + lap bookkeeping (+ remote id when online)
@@ -151,6 +157,27 @@ const carName = (car) => { const pl = players.find((p) => p.car === car); return
 const isOnline = () => mode !== "local";
 const localCount = () => (mode === "local" ? numPlayers : 1);
 
+// --- hazards (earthquakes / eruptions) ------------------------------------
+const hazardsEnabled = () => (mode === "client" ? hostHazards : hazardsOn);
+const hazardCtx = {
+  kickCams: (amount) => { for (const l of locals) l.view.cam.kick(amount); },
+  flash: (text, seconds) => { for (const l of locals) l.view.hud.flashMsg(text, seconds); },
+  sfx: (name, arg) => audio.sfx(name, arg),
+  particles,
+  leaderCars: null,
+};
+// eruption: pulse the sun toward lava red (restored once the glow is gone)
+function tintSky() {
+  if (!env.sun || !env.palette) return;
+  if (hazards.glow > 0.001) {
+    env.sun.color.setHex(env.palette.sun).lerp(ERUPT_TINT, hazards.glow * 0.55);
+    sunTinted = true;
+  } else if (sunTinted) {
+    env.sun.color.setHex(env.palette.sun);
+    sunTinted = false;
+  }
+}
+
 // apply the menu/lobby choices: who is racing, which car class, screen layout
 function applySettings() {
   if (mode === "local") {
@@ -166,7 +193,8 @@ function applySettings() {
     locals = [{ player: players[0], view: views[0] }];
   } else { // client: roster came from the host
     humans = lobbyPlayers.map((lp) => { const p = players[lp.slot]; p.setName(lp.name); return p; }).sort((a, b) => a.slot - b.slot);
-    const me = players[net.mySlot];
+    const me = players[net.mySlot] || players[1];
+    if (!humans.includes(me)) humans.push(me); // roster not in yet: still watch my own seat
     locals = [{ player: me, view: views[0] }];
   }
   cars = [...humans.map((p) => p.car), ...aiCars];
@@ -224,6 +252,8 @@ function restartRace() {
   placeOnGrid();
   skids.clear();
   ghost.setTrack(track.id);
+  hazards.setTrack(track, hazardsEnabled());
+  tintSky();
   shared.hideFinish();
   shared.hideMenu();
   shared.hideLobby();
@@ -236,6 +266,8 @@ function loadTrackDef(def) {
   if (track) track.dispose(scene);
   track = new Track(scene, def);
   env.build(track);
+  sunTinted = false;
+  hazards.setTrack(track, hazardsEnabled());
   for (const ai of ais) ai.track = track;
   ghost.setTrack(track.id);
   shared.setTrack(track.outline(), track.name);
@@ -265,6 +297,8 @@ function showMenu() {
   applySettings();
   for (const v of views) v.hud.setVisible(false);
   placeOnGrid();
+  hazards.reset();
+  tintSky();
   const randomOutline = randomDef ? new Track(null, randomDef, false).outline() : null;
   const carItems = CAR_CLASSES.map((c) => [c.name, c.id]);
   const options = [];
@@ -274,6 +308,7 @@ function showMenu() {
   if (mode !== "client") {
     options.push({ key: "difficulty", label: "DIFFICULTY", items: [["EASY", "easy"], ["NORMAL", "normal"], ["HARD", "hard"]], value: difficulty });
     options.push({ key: "laps", label: "LAPS", items: [["1", 1], ["3", 3], ["5", 5]], value: LAPS });
+    options.push({ key: "hazards", label: "HAZARDS", items: [["ON", true], ["OFF", false]], value: hazardsOn });
   }
   options.push({ key: "car0", label: mode === "local" && numPlayers === 2 ? "P1 CAR" : "CAR", items: carItems, value: carChoice[0] });
   if (mode === "local" && numPlayers === 2) options.push({ key: "car1", label: "P2 CAR", items: carItems, value: carChoice[1], cls: "p2" });
@@ -289,6 +324,7 @@ function showMenu() {
       if (key === "players") { numPlayers = value; saveMem("players", value); }
       else if (key === "difficulty") { difficulty = value; saveMem("difficulty", value); }
       else if (key === "laps") { LAPS = value; saveMem("laps", value); }
+      else if (key === "hazards") { hazardsOn = !!value; saveMem("hazards", hazardsOn); }
       else if (key === "car0") { carChoice[0] = value; saveMem("cars", carChoice); if (mode === "client") net.send({ t: "car", car: value }); }
       else if (key === "car1") { carChoice[1] = value; saveMem("cars", carChoice); }
       showMenu();
@@ -305,11 +341,8 @@ function startRace() {
   if (mode === "client") return;
   if (mode === "host") {
     const def = track.def;
-    net.broadcast({
-      t: "start", def, laps: LAPS, difficulty,
-      players: rosterFor(null),
-    });
-    for (const [id, g] of net.guests) net.send(id, { t: "you", slot: g.slot });
+    const roster = rosterFor();
+    for (const [id, g] of net.guests) net.send(id, { t: "start", def, laps: LAPS, difficulty, hazards: hazardsOn, players: roster, you: g.slot });
   }
   restartRace();
 }
@@ -377,6 +410,9 @@ async function joinLobby(code, name) {
   leaveOnline();
   const client = new NetClient();
   shared.setOnlineStatus(`joining ${code.toUpperCase()}…`);
+  const queued = []; // messages that arrive before we are fully in client mode
+  client.on("msg", (m) => { if (mode === "client" && net === client) onHostMessage(m); else queued.push(m); })
+    .on("disconnect", () => { if (net === client) leaveOnline("host left"); });
   try {
     await client.join(code, myName || "GUEST", carChoice[0]);
   } catch (e) {
@@ -386,10 +422,10 @@ async function joinLobby(code, name) {
   }
   net = client;
   mode = "client";
-  net.mySlot = 1;
+  if (net.mySlot == null) net.mySlot = 1;
   netStatus = `joined ${client.code}`;
-  client.on("msg", onHostMessage).on("disconnect", () => leaveOnline("host left"));
   showMenu();
+  for (const m of queued) onHostMessage(m);
 }
 
 function leaveOnline(reason) {
@@ -416,14 +452,17 @@ function onHostMessage(m) {
       break;
     case "you":
       net.mySlot = m.slot;
+      if (state === "lobby") { applySettings(); renderLobby(); }
       break;
     case "kick":
       leaveOnline(m.reason || "removed by host");
       break;
     case "start": {
       lobbyPlayers = m.players;
+      if (typeof m.you === "number") net.mySlot = m.you; // my seat, carried with the start itself
       LAPS = m.laps;
       difficulty = m.difficulty;
+      hostHazards = m.hazards !== false; // older hosts omit it: on
       const def = m.def;
       loadTrackDef(def);
       restartRace();
@@ -693,6 +732,8 @@ let lastFrameAt = performance.now();
 let frameCount = 0;
 // read-only debug readout (useful from the console / automated checks)
 window.__drift = { get state() { return state; }, get mode() { return mode; }, get raceTime() { return raceTime; }, get countdown() { return countdownT; }, get frames() { return frameCount; },
+  get mySlot() { return net ? net.mySlot : null; }, get guests() { return net && net.guests ? [...net.guests.values()].map((g) => g.name + ":" + g.slot + ":" + (g.conn.open ? "open" : "closed") + ":" + Math.round(performance.now() - g.lastSeen)) : null; }, get netStatus() { return netStatus; }, get localCar() { return locals[0] && locals[0].player ? locals[0].player.car.netId : null; },
+  get humans() { return humans.map((p) => p.car.netId + ":" + p.name); }, get carsPos() { return cars.map((c) => [c.netId, +c.pos.x.toFixed(1), +c.pos.z.toFixed(1), c.mesh.visible]); },
   xr: { get available() { return stereo.available; }, get woven() { return stereo.woven; }, get scale() { return stereo.scale; }, get firstWoven() { return stereo.firstWoven; } } };
 
 // the 2D loop; it stands down while the DisplayXR session drives frames
@@ -794,6 +835,10 @@ function step(now) {
         if (bump > 1.2) { if (l.view.slot === 0) audio.sfx("contact", Math.min(bump / 6, 1.2)); l.view.cam.kick(Math.min(bump / 8, 0.6)); }
       });
       for (const car of cars) track.resolveCollision(car);
+      // hazards: jolts / rock hits land on wallHit before the kick + spark checks
+      hazardCtx.leaderCars = activeCars;
+      hazards.update(dt, raceTime, activeCars, hazardCtx);
+      tintSky();
       for (const l of locals) {
         const p = l.player;
         if (p.car.wallHit) l.view.cam.kick(Math.min(0.2 + p.car.speed / 40, 0.9));
@@ -879,6 +924,7 @@ function step(now) {
 }
 
 // guest's frame: local prediction for own car, puppets for the rest
+const clientSelf = [null]; // reused one-car list for hazards.update
 function clientFrame(dt, myInput) {
   const me = locals[0].player, car = me.car;
   net.sendInput(myInput);
@@ -902,6 +948,12 @@ function clientFrame(dt, myInput) {
       car.netCorr.x *= 1 - k; car.netCorr.z *= 1 - k;
     }
     for (const c of cars) if (c !== car && c.mesh.visible) stepRemote(c, dt);
+    // hazards: jolt / collide only my own car (puppets move by the host's
+    // snapshots); the leader for rock placement comes from every visible car
+    clientSelf[0] = car;
+    hazardCtx.leaderCars = cars;
+    hazards.update(dt, raceTime, clientSelf, hazardCtx);
+    tintSky();
     if (car.wallHit) views[0].cam.kick(Math.min(0.2 + car.speed / 40, 0.9));
     if (car.grounded && !me.prevGrounded) { views[0].cam.kick(0.35); particles.puff(car.pos.x, car.pos.y, car.pos.z, 0xd8d2c4, 8); }
     me.prevGrounded = car.grounded;

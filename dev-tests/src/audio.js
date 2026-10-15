@@ -251,6 +251,16 @@ export class AudioSys {
       case "contact": // car-to-car bump
         this.burst({ type: "lowpass", f0: 600, f1: 180, dur: 0.12, vol: 0.16 * arg });
         break;
+      case "quake": // hazard event: long low rumble, ~4 s
+        this.burst({ type: "lowpass", f0: 220, f1: 70, q: 0.8, dur: 4.2, vol: 0.3 * arg, attack: 0.6 });
+        this.burst({ type: "lowpass", f0: 120, f1: 60, q: 1.2, dur: 3.6, vol: 0.18 * arg, attack: 0.9, at: 0.3 });
+        this.tone({ f0: 35, f1: 31, type: "sine", dur: 4.0, vol: 0.28 * arg, attack: 0.5 });
+        this.tone({ f0: 52, f1: 40, type: "triangle", dur: 2.5, vol: 0.06 * arg, attack: 0.3, at: 0.4 });
+        break;
+      case "rumble-warn": // hazard warning: shorter, quieter distant rumble
+        this.burst({ type: "lowpass", f0: 170, f1: 90, q: 0.8, dur: 1.8, vol: 0.12 * arg, attack: 0.4 });
+        this.tone({ f0: 38, f1: 34, type: "sine", dur: 1.6, vol: 0.12 * arg, attack: 0.35 });
+        break;
     }
   }
 
