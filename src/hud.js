@@ -1,8 +1,22 @@
-// hud.js — DOM HUD: speed + bar, laps, position, live leaderboard, drift
-// score/combo/boost meter, minimap, messages, screen effects, title menu.
-export class HUD {
-  constructor() {
-    const $ = (id) => document.getElementById(id);
+// hud.js — DOM HUD. One PlayerHUD per viewport (stamped from the template
+// in index.html): speed + bar, laps, position, leaderboard, drift meter,
+// messages, screen effects. One SharedHUD for the minimap, track label,
+// finish/pause panels and the title menu.
+
+const fmtTime = (t) => {
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  return `${m}:${s.toFixed(2).padStart(5, "0")}`;
+};
+
+export class PlayerHUD {
+  constructor(slot) {
+    const tpl = document.getElementById("player-hud-tpl");
+    const root = tpl.content.firstElementChild.cloneNode(true);
+    root.dataset.slot = slot;
+    document.getElementById("players").appendChild(root);
+    this.root = root;
+    const $ = (cls) => root.querySelector("." + cls);
     this.elSpeed = $("speed-value");
     this.elSpeedBar = $("speed-bar").firstElementChild;
     this.elBoost = $("boost-flag");
@@ -15,32 +29,95 @@ export class HUD {
     this.elPos = $("hud-pos");
     this.elBoard = $("hud-board");
     this.elMsg = $("hud-msg");
+    this.elHint = $("hud-hint");
+    this.elTag = $("hud-tag");
+    this.elVignette = $("vignette");
+    this.elGlow = $("boost-glow");
+    this.elTag.textContent = `P${slot + 1}`;
+    this.msgTimer = 0;
+    this.boardCache = "";
+  }
+
+  setVisible(v) { this.root.hidden = !v; }
+  setHint(html) { this.elHint.innerHTML = html; }
+
+  flashMsg(text, seconds = 1.2) {
+    this.elMsg.textContent = text;
+    this.elMsg.classList.add("show");
+    this.msgTimer = seconds;
+  }
+
+  // state: { speedKmh, speedFrac, lap, laps, curLap, lastLap, bestLap, pos,
+  //          drifting, driftScore, combo, driftCharge, boostFlash, padBoost,
+  //          board: [{pos, name, color, gap, me}] }
+  update(dt, state) {
+    this.elSpeed.textContent = Math.round(state.speedKmh);
+    this.elSpeedBar.style.width = `${Math.round(Math.min(1, state.speedFrac) * 100)}%`;
+    this.elBoost.classList.toggle("show", state.boostFlash > 0);
+    const glow = state.boostFlash > 0.25 || state.padBoost > 0;
+    this.elGlow.style.opacity = glow ? "1" : "0";
+    this.elGlow.classList.toggle("pad", state.padBoost > 0);
+    this.elVignette.style.opacity = (Math.min(1, state.speedFrac) * 0.9).toFixed(2);
+
+    this.elLapCounter.textContent = state.finished ? "FINISHED" : `LAP ${Math.min(state.lap, state.laps)}/${state.laps}`;
+    const fmt = (t) => t == null ? "--:--.--" : fmtTime(t);
+    this.elLapTimes.innerHTML =
+      `CUR  ${fmt(state.curLap)}<br>LAST ${fmt(state.lastLap)}<br><b>BEST ${fmt(state.bestLap)}</b>`;
+
+    const suffix = state.pos === 1 ? "st" : state.pos === 2 ? "nd" : state.pos === 3 ? "rd" : "th";
+    this.elPos.innerHTML = `${state.pos}<span>${suffix}</span><small>POSITION</small>`;
+
+    if (state.board) {
+      const html = state.board.map((r) =>
+        `<div class="row${r.me ? " me" : ""}"><span class="p">${r.pos}</span><i style="background:${r.color}"></i>` +
+        `<span class="n">${r.name}</span><span class="g">${r.gap}</span></div>`).join("");
+      if (html !== this.boardCache) { this.boardCache = html; this.elBoard.innerHTML = html; }
+    }
+
+    if (state.drifting || state.driftScore > 0) {
+      this.elDrift.classList.add("show");
+      this.elDriftScore.textContent = Math.floor(state.driftScore).toLocaleString();
+      const c = state.combo;
+      this.elDriftCombo.textContent = `x${c.toFixed(1)}${state.drifting ? "" : " (banked)"}`;
+      this.elDriftCombo.style.color = c >= 3 ? "#ff5e2e" : "#ff9d2e";
+      this.elDriftBar.style.width = `${Math.round(Math.min(1, state.driftCharge || 0) * 100)}%`;
+    } else {
+      this.elDrift.classList.remove("show");
+    }
+
+    if (this.msgTimer > 0) {
+      this.msgTimer -= dt;
+      if (this.msgTimer <= 0) this.elMsg.classList.remove("show");
+    }
+  }
+
+  fmtTime(t) { return fmtTime(t); }
+}
+
+export class SharedHUD {
+  constructor() {
+    const $ = (id) => document.getElementById(id);
     this.elMap = $("map-canvas");
     this.elFinish = $("finish-panel");
     this.elFinishRows = $("finish-rows");
     this.elTrack = $("hud-track");
-    this.elHint = $("hud-hint");
-    this.elVignette = $("vignette");
-    this.elGlow = $("boost-glow");
     this.elMenu = $("menu");
     this.elTracks = $("tracks");
-    this.elDiff = $("opt-diff");
-    this.elLaps = $("opt-laps");
+    this.elOpts = $("opts");
+    this.elBlurb = $("car-blurb");
     this.mapCtx = this.elMap.getContext("2d");
     this.mapBg = document.createElement("canvas");
     this.mapBg.width = this.elMap.width;
     this.mapBg.height = this.elMap.height;
-    this.msgTimer = 0;
     this.trackTransform = null;
-    this.boardCache = "";
-    this.hudEls = ["hud-speed", "hud-drift", "hud-lap", "hud-pos", "hud-board", "hud-map", "hud-track", "hud-hint", "vignette", "boost-glow"].map($);
+    this.raceEls = [$("hud-map"), $("hud-track")];
   }
 
   setRaceHudVisible(v) {
-    for (const el of this.hudEls) el.style.visibility = v ? "visible" : "hidden";
+    for (const el of this.raceEls) el.style.visibility = v ? "visible" : "hidden";
   }
 
-  // small outline thumbnail for the menu cards
+  // small outline thumbnail for the menu cards + the minimap background
   static drawOutline(canvas, outlinePts, color = "#c8d4e4") {
     const ctx = canvas.getContext("2d");
     const w = canvas.width, h = canvas.height, pad = 10;
@@ -68,13 +145,7 @@ export class HUD {
 
   setTrack(outlinePts, trackName = "") {
     this.elTrack.textContent = trackName;
-    this.trackTransform = HUD.drawOutline(this.mapBg, outlinePts);
-  }
-
-  flashMsg(text, seconds = 1.2) {
-    this.elMsg.textContent = text;
-    this.elMsg.classList.add("show");
-    this.msgTimer = seconds;
+    this.trackTransform = SharedHUD.drawOutline(this.mapBg, outlinePts);
   }
 
   showFinish(rowsHtml) {
@@ -85,41 +156,55 @@ export class HUD {
   hideFinish() { this.elFinish.style.display = "none"; }
 
   // --- title menu ---------------------------------------------------------
-  // opts: { tracks: [{id, name, outline, best}], trackIndex, difficulty, laps,
-  //         onTrack(i), onDifficulty(d), onLaps(n), onRace() }
+  // opts: { tracks: [{id, name, outline, best, random}], trackIndex,
+  //         options: [{ key, label, items: [[label, value]], value, cls? }],
+  //         blurb, onTrack(i), onOption(key, value), onRace() }
   showMenu(opts) {
     this.elMenu.style.display = "block";
     this.setRaceHudVisible(false);
-    this.elMsg.classList.remove("show");
     this.elTracks.innerHTML = "";
     opts.tracks.forEach((t, i) => {
       const card = document.createElement("div");
       card.className = "track-card" + (i === opts.trackIndex ? " sel" : "");
       const c = document.createElement("canvas");
       c.width = 150; c.height = 100;
-      HUD.drawOutline(c, t.outline, i === opts.trackIndex ? "#ffd34d" : "#9ab4cc");
+      if (t.outline) SharedHUD.drawOutline(c, t.outline, i === opts.trackIndex ? "#ffd34d" : t.random ? "#5fe8ff" : "#9ab4cc");
+      else { // random slot, nothing rolled yet: a dice glyph
+        const ctx = c.getContext("2d");
+        ctx.font = "64px 'Rajdhani', sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillStyle = "#5fe8ff"; ctx.fillText("⚄", 75, 52);
+      }
       card.appendChild(c);
       const n = document.createElement("div");
       n.className = "name"; n.textContent = t.name;
       card.appendChild(n);
       const b = document.createElement("div");
-      b.className = "best"; b.textContent = t.best ? `BEST ${this.fmtTime(t.best)}` : "NO RECORD";
+      b.className = "best";
+      b.textContent = t.random ? "NEW LAYOUT EVERY TIME · [R]" : t.best ? `BEST ${fmtTime(t.best)}` : "NO RECORD";
       card.appendChild(b);
       card.addEventListener("click", () => opts.onTrack(i));
       this.elTracks.appendChild(card);
     });
-    const seg = (el, items, cur, fn) => {
-      el.innerHTML = "";
-      for (const [label, value] of items) {
+    this.elOpts.innerHTML = "";
+    for (const o of opts.options) {
+      const wrap = document.createElement("div");
+      wrap.className = "opt";
+      const label = document.createElement("label");
+      label.textContent = o.label;
+      wrap.appendChild(label);
+      const seg = document.createElement("div");
+      seg.className = "seg";
+      for (const [text, value] of o.items) {
         const btn = document.createElement("button");
-        btn.textContent = label;
-        if (value === cur) btn.classList.add("on");
-        btn.addEventListener("click", () => fn(value));
-        el.appendChild(btn);
+        btn.textContent = text;
+        if (value === o.value) btn.className = "on" + (o.cls ? " " + o.cls : "");
+        btn.addEventListener("click", () => opts.onOption(o.key, value));
+        seg.appendChild(btn);
       }
-    };
-    seg(this.elDiff, [["EASY", "easy"], ["NORMAL", "normal"], ["HARD", "hard"]], opts.difficulty, opts.onDifficulty);
-    seg(this.elLaps, [["1", 1], ["3", 3], ["5", 5]], opts.laps, opts.onLaps);
+      wrap.appendChild(seg);
+      this.elOpts.appendChild(wrap);
+    }
+    this.elBlurb.textContent = opts.blurb || "";
     document.getElementById("menu-race").onclick = opts.onRace;
   }
 
@@ -128,69 +213,57 @@ export class HUD {
     this.setRaceHudVisible(true);
   }
 
-  // state: { speedKmh, speedFrac, lap, laps, curLap, lastLap, bestLap, pos,
-  //          drifting, driftScore, combo, driftCharge, boostFlash, padBoost,
-  //          board: [{pos, name, color, gap, me, finished}], dots: [{x, z, color, r}] }
-  update(dt, state) {
-    this.elSpeed.textContent = Math.round(state.speedKmh);
-    this.elSpeedBar.style.width = `${Math.round(Math.min(1, state.speedFrac) * 100)}%`;
-    this.elBoost.classList.toggle("show", state.boostFlash > 0);
-    const glow = state.boostFlash > 0.25 || state.padBoost > 0;
-    this.elGlow.style.opacity = glow ? "1" : "0";
-    this.elGlow.classList.toggle("pad", state.padBoost > 0);
-    this.elVignette.style.opacity = (Math.min(1, state.speedFrac) * 0.9).toFixed(2);
+  // --- online lobby -------------------------------------------------------
+  // wire the menu's online controls once: fns = { onHost(name), onJoin(code, name) }
+  bindOnline(fns, savedName = "") {
+    const name = document.getElementById("online-name");
+    const code = document.getElementById("online-code");
+    name.value = savedName;
+    document.getElementById("online-host").onclick = () => fns.onHost(name.value.trim());
+    document.getElementById("online-join").onclick = () => fns.onJoin(code.value.trim(), name.value.trim());
+    code.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.stopPropagation(); fns.onJoin(code.value.trim(), name.value.trim()); } });
+    for (const el of [name, code]) el.addEventListener("keydown", (e) => e.stopPropagation()); // typing must not trigger menu hotkeys
+  }
 
-    this.elLapCounter.textContent = `LAP ${Math.min(state.lap, state.laps)}/${state.laps}`;
-    const fmt = (t) => t == null ? "--:--.--" : this.fmtTime(t);
-    this.elLapTimes.innerHTML =
-      `CUR  ${fmt(state.curLap)}<br>LAST ${fmt(state.lastLap)}<br><b>BEST ${fmt(state.bestLap)}</b>`;
+  setOnlineStatus(text, isError = false) {
+    const el = document.getElementById("online-status");
+    el.textContent = text;
+    el.classList.toggle("err", isError);
+  }
 
-    const suffix = state.pos === 1 ? "st" : state.pos === 2 ? "nd" : state.pos === 3 ? "rd" : "th";
-    this.elPos.innerHTML = `${state.pos}<span>${suffix}</span><small>POSITION</small>`;
+  // lobby: { code, players: [{name, color, car, host, me}], isHost, note, onStart, onLeave }
+  showLobby(lobby) {
+    const el = document.getElementById("lobby");
+    el.style.display = "block";
+    document.getElementById("lobby-code").textContent = lobby.code || "-----";
+    document.getElementById("lobby-players").innerHTML = lobby.players.map((p) =>
+      `<div class="row"><i style="background:${p.color}"></i><span>${p.name}${p.me ? " (you)" : ""}</span>` +
+      `<span class="car">${p.car}</span><span class="tag">${p.host ? "HOST" : ""}</span></div>`).join("");
+    document.getElementById("lobby-note").innerHTML = lobby.note || "";
+    const start = document.getElementById("lobby-start");
+    start.style.display = lobby.isHost ? "block" : "none";
+    start.onclick = lobby.onStart;
+    document.getElementById("lobby-leave").onclick = lobby.onLeave;
+    document.getElementById("lobby-copy").onclick = () => { try { navigator.clipboard.writeText(lobby.code); } catch (e) { /* noop */ } };
+  }
 
-    // leaderboard (only touch the DOM when the text changes)
-    if (state.board) {
-      const html = state.board.map((r) =>
-        `<div class="row${r.me ? " me" : ""}"><span class="p">${r.pos}</span><i style="background:${r.color}"></i>` +
-        `<span class="n">${r.name}</span><span class="g">${r.gap}</span></div>`).join("");
-      if (html !== this.boardCache) { this.boardCache = html; this.elBoard.innerHTML = html; }
-    }
+  hideLobby() { document.getElementById("lobby").style.display = "none"; }
 
-    if (state.drifting || state.driftScore > 0) {
-      this.elDrift.classList.add("show");
-      this.elDriftScore.textContent = Math.floor(state.driftScore).toLocaleString();
-      const c = state.combo;
-      this.elDriftCombo.textContent = `x${c.toFixed(1)}${state.drifting ? "" : " (banked)"}`;
-      this.elDriftCombo.style.color = c >= 3 ? "#ff5e2e" : "#ff9d2e";
-      this.elDriftBar.style.width = `${Math.round(Math.min(1, state.driftCharge || 0) * 100)}%`;
-    } else {
-      this.elDrift.classList.remove("show");
-    }
-
-    if (this.msgTimer > 0) {
-      this.msgTimer -= dt;
-      if (this.msgTimer <= 0) this.elMsg.classList.remove("show");
-    }
-
-    // minimap
-    if (this.trackTransform) {
-      const ctx = this.mapCtx;
-      ctx.clearRect(0, 0, this.elMap.width, this.elMap.height);
-      ctx.drawImage(this.mapBg, 0, 0);
-      for (const d of state.dots) {
-        const [mx, mz] = this.trackTransform(d.x, d.z);
-        ctx.fillStyle = d.color;
-        ctx.beginPath();
-        ctx.arc(mx, mz, d.r || 3, 0, Math.PI * 2);
-        ctx.fill();
-        if (d.ring) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke(); }
-      }
+  // dots: [{x, z, color, r, ring}]
+  drawMap(dots) {
+    if (!this.trackTransform) return;
+    const ctx = this.mapCtx;
+    ctx.clearRect(0, 0, this.elMap.width, this.elMap.height);
+    ctx.drawImage(this.mapBg, 0, 0);
+    for (const d of dots) {
+      const [mx, mz] = this.trackTransform(d.x, d.z);
+      ctx.fillStyle = d.color;
+      ctx.beginPath();
+      ctx.arc(mx, mz, d.r || 3, 0, Math.PI * 2);
+      ctx.fill();
+      if (d.ring) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke(); }
     }
   }
 
-  fmtTime(t) {
-    const m = Math.floor(t / 60);
-    const s = t - m * 60;
-    return `${m}:${s.toFixed(2).padStart(5, "0")}`;
-  }
+  fmtTime(t) { return fmtTime(t); }
 }

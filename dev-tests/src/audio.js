@@ -1,11 +1,47 @@
-// audio.js — WebAudio synth, no assets. Continuous layers: a geared engine
-// (sub + detuned saws through a soft clipper and an rpm-tracking lowpass),
-// speed-scaled wind, and tire squeal (band-passed noise gated by slip).
-// One-shot effects: countdown beeps, lap/best/finish jingles, drift-boost
-// whoosh, boost-pad sweep, wall thud, landing thump, upshift exhaust pop.
+// audio.js — WebAudio, no asset downloads. Built to sit under the game
+// rather than on top of it: a geared engine built from pre-rendered loops
+// of individual combustion pulses (pitch-shifted and cross-faded by rpm
+// band like a sample set), low-passed and soft-clipped, intake hiss under
+// throttle, speed-scaled wind, and tyre squeal that only speaks up during
+// real slides. One-shots are soft
+// sine/triangle tones and filtered noise: countdown, lap chimes, boost
+// whoosh, pad sweep, wall thud, landing thump, upshift blip.
 
 const GEARS = [0, 8, 15, 23, 31, 40, 52]; // m/s shift points
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// Render a seamless loop of combustion pulses at a reference firing rate.
+// Each pulse: a short sine thump that chirps down onto fRef, plus a noise
+// crack; timing jitters ~8% and level ~40% so the texture never sounds
+// machine-perfect. Written modulo the buffer length, so it loops cleanly.
+export function renderEngineLoop(ctx, { fRef, thump, rasp }, seconds = 2) {
+  const sr = ctx.sampleRate, len = Math.round(seconds * sr);
+  const buf = ctx.createBuffer(1, len, sr);
+  const d = buf.getChannelData(0);
+  const pulses = Math.round(seconds * fRef);
+  const period = len / pulses;
+  const decay = period * 1.3;
+  const n = Math.round(decay * 3);
+  for (let k = 0; k < pulses; k++) {
+    const start = k * period + (Math.random() - 0.5) * period * 0.16;
+    const amp = 0.8 + Math.random() * 0.4;
+    const ph0 = Math.random() * Math.PI * 2;
+    for (let i = 0; i < n; i++) {
+      const tt = i / sr;
+      const env = Math.exp(-i / decay);
+      const fr = fRef * (1 + 1.4 * Math.exp(-i / (decay * 0.25)));
+      const s = Math.sin(ph0 + 2 * Math.PI * fr * tt) * thump;
+      const nz = (Math.random() * 2 - 1) * rasp * Math.exp(-i / (decay * 0.3));
+      const idx = ((Math.round(start) + i) % len + len) % len;
+      d[idx] += amp * env * (s + nz);
+    }
+  }
+  let peak = 0;
+  for (let i = 0; i < len; i++) peak = Math.max(peak, Math.abs(d[i]));
+  const g = peak > 0 ? 0.8 / peak : 1;
+  for (let i = 0; i < len; i++) d[i] *= g;
+  return buf;
+}
 
 export class AudioSys {
   constructor() {
@@ -14,6 +50,7 @@ export class AudioSys {
     this.rpm = 0.2;
     this.prev = { boostFlash: 0, padBoost: 0, grounded: true, airTime: 0, wallHit: false, drifting: false };
     this.wallCooldown = 0;
+    this.squealLvl = 0;
   }
 
   // must be called from a user gesture (keydown / pointerdown)
@@ -26,81 +63,101 @@ export class AudioSys {
     if (!AC) return;
     const ctx = this.ctx = new AC();
     this.master = ctx.createGain();
-    this.master.gain.value = 0.5;
-    // soft limiter so stacked one-shots never clip
+    this.master.gain.value = 0.42;
+    // gentle bus compressor: glues layers, stops one-shots from spiking
     this.comp = ctx.createDynamicsCompressor();
-    this.comp.threshold.value = -12;
-    this.comp.knee.value = 18;
-    this.comp.ratio.value = 6;
-    this.comp.attack.value = 0.003;
-    this.comp.release.value = 0.12;
+    this.comp.threshold.value = -16;
+    this.comp.knee.value = 20;
+    this.comp.ratio.value = 4;
+    this.comp.attack.value = 0.005;
+    this.comp.release.value = 0.15;
     this.master.connect(this.comp);
     this.comp.connect(ctx.destination);
 
-    // shared looped white noise source (wind, squeal, and one-shot bursts)
+    // shared looped noise buffer (wind, squeal, exhaust, one-shot bursts)
     const len = ctx.sampleRate * 2;
     this.noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
     const data = this.noiseBuf.getChannelData(0);
     for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
 
-    // --- engine: sub sine + two detuned saws -> soft clip -> lowpass ---
-    this.engineGain = ctx.createGain();
-    this.engineGain.gain.value = 0.0001;
+    // --- engine: sampled-style. Three looped buffers of individual
+    // combustion pulses (low thump + noise crack, jittered in time and
+    // level) are rendered once at init, then pitch-shifted with
+    // playbackRate and cross-faded by rpm band, the way a real engine
+    // sample set works. Irregular pulses read as an engine, not a buzzer.
+    this.bands = [
+      { fRef: 36,  thump: 1.0, rasp: 0.30, lo: -1,  mid: 0.0,  hi: 0.45 },
+      { fRef: 85,  thump: 0.8, rasp: 0.55, lo: 0.1, mid: 0.5,  hi: 0.9  },
+      { fRef: 170, thump: 0.6, rasp: 0.85, lo: 0.55, mid: 1.0, hi: 2    },
+    ];
+    this.engineSum = ctx.createGain();
+    this.engineSum.gain.value = 1;
+    for (const b of this.bands) {
+      b.buffer = renderEngineLoop(ctx, b);
+      b.src = ctx.createBufferSource();
+      b.src.buffer = b.buffer;
+      b.src.loop = true;
+      b.gain = ctx.createGain();
+      b.gain.gain.value = 0;
+      b.src.connect(b.gain);
+      b.gain.connect(this.engineSum);
+      b.src.start();
+    }
     this.engineFilter = ctx.createBiquadFilter();
     this.engineFilter.type = "lowpass";
-    this.engineFilter.frequency.value = 700;
-    this.engineFilter.Q.value = 1.2;
+    this.engineFilter.frequency.value = 600;
+    this.engineFilter.Q.value = 0.7;
     this.shaper = ctx.createWaveShaper();
     const curve = new Float32Array(512);
-    for (let i = 0; i < 512; i++) { const x = (i / 255.5) - 1; curve[i] = Math.tanh(x * 2.2); }
+    for (let i = 0; i < 512; i++) { const x = (i / 255.5) - 1; curve[i] = Math.tanh(x * 1.3); }
     this.shaper.curve = curve;
     this.shaper.oversample = "2x";
-    this.oscs = [];
-    const mk = (type, detune, g) => {
-      const o = ctx.createOscillator();
-      o.type = type;
-      o.detune.value = detune;
-      const og = ctx.createGain();
-      og.gain.value = g;
-      o.connect(og);
-      og.connect(this.shaper);
-      o.start();
-      this.oscs.push(o);
-      return o;
-    };
-    this.oscSub = mk("sine", 0, 0.9);       // half the fundamental: the thump
-    this.oscA = mk("sawtooth", -7, 0.45);
-    this.oscB = mk("sawtooth", 9, 0.45);
-    this.oscC = mk("square", 0, 0.18);      // an octave up: the bark
-    this.shaper.connect(this.engineFilter);
-    this.engineFilter.connect(this.engineGain);
-    this.engineGain.connect(this.master);
+    this.engineBus = ctx.createGain();
+    this.engineBus.gain.value = 0.0001;
+    this.engineSum.connect(this.engineFilter);
+    this.engineFilter.connect(this.shaper);
+    this.shaper.connect(this.engineBus);
+    this.engineBus.connect(this.master);
+    // intake hiss under throttle
+    this.intake = this.loopNoise();
+    this.intakeFilter = ctx.createBiquadFilter();
+    this.intakeFilter.type = "lowpass";
+    this.intakeFilter.frequency.value = 700;
+    this.intakeGain = ctx.createGain();
+    this.intakeGain.gain.value = 0.0001;
+    this.intake.connect(this.intakeFilter);
+    this.intakeFilter.connect(this.intakeGain);
+    this.intakeGain.connect(this.master);
 
-    // --- wind: lowpassed noise, swells with speed ---
+    // --- wind: lowpassed noise, swells with speed ------------------------
     this.wind = this.loopNoise();
     this.windFilter = ctx.createBiquadFilter();
     this.windFilter.type = "lowpass";
-    this.windFilter.frequency.value = 400;
+    this.windFilter.frequency.value = 350;
     this.windGain = ctx.createGain();
     this.windGain.gain.value = 0.0001;
     this.wind.connect(this.windFilter);
     this.windFilter.connect(this.windGain);
     this.windGain.connect(this.master);
 
-    // --- tire squeal: two peaking bandpasses in parallel (richer than one) ---
+    // --- tyre squeal: two softened bandpasses, then a lowpass to tame hiss
     this.squealGain = ctx.createGain();
     this.squealGain.gain.value = 0.0001;
+    this.squealLP = ctx.createBiquadFilter();
+    this.squealLP.type = "lowpass";
+    this.squealLP.frequency.value = 2200;
     this.squealFilters = [];
-    for (const [f, q] of [[900, 10], [1500, 14]]) {
+    for (const [f, q] of [[800, 5], [1300, 7]]) {
       const src = this.loopNoise();
       const bp = ctx.createBiquadFilter();
       bp.type = "bandpass";
       bp.frequency.value = f;
       bp.Q.value = q;
       src.connect(bp);
-      bp.connect(this.squealGain);
+      bp.connect(this.squealLP);
       this.squealFilters.push(bp);
     }
+    this.squealLP.connect(this.squealGain);
     this.squealGain.connect(this.master);
   }
 
@@ -113,7 +170,7 @@ export class AudioSys {
   }
 
   // ---- one-shot building blocks -------------------------------------------
-  tone({ f0, f1 = f0, type = "square", dur = 0.1, vol = 0.12, at = 0, attack = 0.005 }) {
+  tone({ f0, f1 = f0, type = "sine", dur = 0.1, vol = 0.1, at = 0, attack = 0.008 }) {
     const ctx = this.ctx, t = ctx.currentTime + at;
     const o = ctx.createOscillator();
     o.type = type;
@@ -129,7 +186,7 @@ export class AudioSys {
     o.stop(t + dur + 0.05);
   }
 
-  burst({ type = "lowpass", f0 = 800, f1 = f0, q = 1, dur = 0.2, vol = 0.2, at = 0, attack = 0.004 }) {
+  burst({ type = "lowpass", f0 = 800, f1 = f0, q = 1, dur = 0.2, vol = 0.15, at = 0, attack = 0.006 }) {
     const ctx = this.ctx, t = ctx.currentTime + at;
     const src = ctx.createBufferSource();
     src.buffer = this.noiseBuf;
@@ -155,44 +212,44 @@ export class AudioSys {
     if (!this.ctx) return;
     switch (name) {
       case "tick":
-        this.tone({ f0: 740, type: "square", dur: 0.12, vol: 0.14 });
+        this.tone({ f0: 660, type: "sine", dur: 0.14, vol: 0.09 });
         break;
       case "go":
-        this.tone({ f0: 1180, type: "square", dur: 0.5, vol: 0.16 });
-        this.tone({ f0: 590, type: "sawtooth", dur: 0.5, vol: 0.06 });
+        this.tone({ f0: 990, type: "sine", dur: 0.5, vol: 0.1 });
+        this.tone({ f0: 1320, type: "sine", dur: 0.45, vol: 0.04, at: 0.02 });
         break;
       case "lap":
-        this.tone({ f0: 660, type: "triangle", dur: 0.12, vol: 0.14 });
-        this.tone({ f0: 990, type: "triangle", dur: 0.22, vol: 0.14, at: 0.11 });
+        this.tone({ f0: 660, type: "triangle", dur: 0.14, vol: 0.08 });
+        this.tone({ f0: 990, type: "triangle", dur: 0.26, vol: 0.08, at: 0.12 });
         break;
       case "best":
-        [660, 880, 1100, 1320].forEach((f, i) => this.tone({ f0: f, type: "triangle", dur: i === 3 ? 0.4 : 0.11, vol: 0.14, at: i * 0.1 }));
+        [660, 880, 1100, 1320].forEach((f, i) => this.tone({ f0: f, type: "triangle", dur: i === 3 ? 0.45 : 0.12, vol: 0.08, at: i * 0.1 }));
         break;
       case "finish":
         [[523, 0], [659, 0], [784, 0], [1047, 0.18], [1319, 0.36]].forEach(([f, at]) =>
-          this.tone({ f0: f, type: "triangle", dur: 0.9, vol: 0.09, at, attack: 0.02 }));
+          this.tone({ f0: f, type: "triangle", dur: 1.0, vol: 0.055, at, attack: 0.03 }));
         break;
-      case "boost": // drift-exit / trick boost: jet whoosh + rising tone
-        this.burst({ type: "bandpass", f0: 400, f1: 3200, q: 1.4, dur: 0.55, vol: 0.32 * arg, attack: 0.03 });
-        this.tone({ f0: 220, f1: 880, type: "sawtooth", dur: 0.35, vol: 0.07 * arg, attack: 0.02 });
+      case "boost": // drift-exit / trick boost: airy whoosh
+        this.burst({ type: "bandpass", f0: 300, f1: 1800, q: 1.2, dur: 0.6, vol: 0.18 * arg, attack: 0.05 });
+        this.tone({ f0: 180, f1: 520, type: "sine", dur: 0.4, vol: 0.05 * arg, attack: 0.03 });
         break;
-      case "pad": // boost panel: quick ascending sweep
-        this.tone({ f0: 300, f1: 1200, type: "square", dur: 0.3, vol: 0.09 });
-        this.burst({ type: "highpass", f0: 1500, dur: 0.3, vol: 0.12 });
+      case "pad": // boost panel: short rising sweep
+        this.tone({ f0: 260, f1: 900, type: "triangle", dur: 0.3, vol: 0.06 });
+        this.burst({ type: "highpass", f0: 1200, dur: 0.25, vol: 0.06 });
         break;
       case "wall": // thud + scrape
-        this.tone({ f0: 90, f1: 38, type: "sine", dur: 0.22, vol: 0.45 * arg, attack: 0.002 });
-        this.burst({ type: "lowpass", f0: 320, f1: 120, dur: 0.18, vol: 0.4 * arg });
+        this.tone({ f0: 80, f1: 36, type: "sine", dur: 0.22, vol: 0.3 * arg, attack: 0.003 });
+        this.burst({ type: "lowpass", f0: 300, f1: 110, dur: 0.2, vol: 0.22 * arg });
         break;
       case "land": // suspension thump
-        this.tone({ f0: 70, f1: 40, type: "sine", dur: 0.18, vol: 0.35 * arg, attack: 0.002 });
-        this.burst({ type: "lowpass", f0: 500, f1: 150, dur: 0.14, vol: 0.2 * arg });
+        this.tone({ f0: 64, f1: 38, type: "sine", dur: 0.18, vol: 0.25 * arg, attack: 0.003 });
+        this.burst({ type: "lowpass", f0: 420, f1: 140, dur: 0.14, vol: 0.12 * arg });
         break;
-      case "shift": // upshift exhaust pop
-        this.burst({ type: "bandpass", f0: 220, q: 2, dur: 0.07, vol: 0.18 });
+      case "shift": // upshift: brief exhaust blip
+        this.burst({ type: "bandpass", f0: 200, q: 1.5, dur: 0.06, vol: 0.09 });
         break;
       case "contact": // car-to-car bump
-        this.burst({ type: "lowpass", f0: 700, f1: 200, dur: 0.12, vol: 0.25 * arg });
+        this.burst({ type: "lowpass", f0: 600, f1: 180, dur: 0.12, vol: 0.16 * arg });
         break;
     }
   }
@@ -205,41 +262,49 @@ export class AudioSys {
     const throttle = input ? (input.throttle || 0) : 0;
 
     // --- engine: gear from speed, rpm rises through the gear and drops at
-    // each shift. Idle hangs around 0.18; redline is 1.
+    // each shift. Idle hangs around 0.15; redline is 1.
     let gear = 0;
     while (gear < GEARS.length - 2 && spd >= GEARS[gear + 1]) gear++;
     const span = GEARS[gear + 1] - GEARS[gear];
-    let rpmT = 0.3 + 0.7 * clamp((spd - GEARS[gear]) / span, 0, 1);
-    if (spd < 1.5) rpmT = 0.18 + throttle * 0.25; // revving at the line
-    if (car.drifting && throttle) rpmT = Math.min(1, rpmT + 0.12); // wheelspin flare
+    let rpmT = 0.28 + 0.72 * clamp((spd - GEARS[gear]) / span, 0, 1);
+    if (spd < 1.5) rpmT = 0.15 + throttle * 0.3; // idle / revving at the line
+    if (car.drifting && throttle) rpmT = Math.min(1, rpmT + 0.1); // wheelspin flare
+    if (!car.grounded) rpmT = Math.min(1, rpmT + 0.15 * throttle); // free-revving in the air
     if (gear !== this.gear) {
       if (gear > this.gear && spd > 6) this.sfx("shift");
       this.gear = gear;
     }
-    this.rpm += (rpmT - this.rpm) * Math.min(1, (rpmT > this.rpm ? 7 : 12) * dt);
-    const f = 42 + this.rpm * 190;
-    this.oscSub.frequency.setTargetAtTime(f * 0.5, t, 0.02);
-    this.oscA.frequency.setTargetAtTime(f, t, 0.02);
-    this.oscB.frequency.setTargetAtTime(f, t, 0.02);
-    this.oscC.frequency.setTargetAtTime(f * 2, t, 0.02);
-    this.engineFilter.frequency.setTargetAtTime(380 + this.rpm * 2600 + throttle * 500, t, 0.05);
-    const load = 0.045 + this.rpm * 0.05 + throttle * 0.035;
-    this.engineGain.gain.setTargetAtTime(car.grounded ? load : load * 0.6, t, 0.05);
+    this.rpm += (rpmT - this.rpm) * Math.min(1, (rpmT > this.rpm ? 6 : 10) * dt);
+    const f = 30 + this.rpm * 170; // firing rate: ~900 rpm idle .. ~6000 rpm (4-cyl)
+    for (const b of this.bands) {
+      // triangular cross-fade window per band over rpm
+      let w;
+      if (this.rpm <= b.mid) w = b.lo < -0.5 ? 1 : clamp((this.rpm - b.lo) / Math.max(b.mid - b.lo, 1e-3), 0, 1);
+      else w = b.hi > 1.5 ? 1 : clamp((b.hi - this.rpm) / Math.max(b.hi - b.mid, 1e-3), 0, 1);
+      b.gain.gain.setTargetAtTime(w * w, t, 0.05);
+      b.src.playbackRate.setTargetAtTime(clamp(f / b.fRef, 0.3, 3.5), t, 0.03);
+    }
+    this.engineFilter.frequency.setTargetAtTime(320 + this.rpm * 2400 + throttle * 700, t, 0.06);
+    const load = 0.05 + this.rpm * 0.05 + throttle * 0.035;
+    this.engineBus.gain.setTargetAtTime(car.grounded ? load : load * 0.7, t, 0.06);
+    this.intakeGain.gain.setTargetAtTime(throttle * (0.012 + this.rpm * 0.02), t, 0.08);
+    this.intakeFilter.frequency.setTargetAtTime(500 + this.rpm * 1500, t, 0.08);
 
     // --- wind: quadratic with speed, airborne = louder and brighter ---
     const air = !car.grounded;
-    const wind = Math.pow(Math.min(spd / 45, 1), 2) * 0.11 * (air ? 1.8 : 1);
-    this.windGain.gain.setTargetAtTime(wind, t, 0.1);
-    this.windFilter.frequency.setTargetAtTime(300 + spd * 14 + (air ? 500 : 0), t, 0.1);
+    const wind = Math.pow(Math.min(spd / 45, 1), 2) * 0.05 * (air ? 1.8 : 1);
+    this.windGain.gain.setTargetAtTime(wind, t, 0.12);
+    this.windFilter.frequency.setTargetAtTime(250 + spd * 11 + (air ? 400 : 0), t, 0.12);
 
-    // --- squeal grows with slip angle and speed ---
+    // --- squeal: only in genuine slides, eased in/out so it never chatters
     const slip = Math.abs(car.slipAngle);
-    let squeal = 0;
-    if (car.grounded && spd > 6 && slip > 0.14) squeal = Math.min((slip - 0.14) * spd * 0.0045, 0.07);
-    if (car.wallHit) squeal = Math.max(squeal, 0.02);
-    this.squealFilters[0].frequency.setTargetAtTime(750 + slip * 900, t, 0.04);
-    this.squealFilters[1].frequency.setTargetAtTime(1300 + slip * 1400 + spd * 6, t, 0.04);
-    this.squealGain.gain.setTargetAtTime(squeal, t, 0.05);
+    let want = 0;
+    if (car.grounded && spd > 7 && slip > 0.18) want = Math.min((slip - 0.18) * spd * 0.0032, 0.035);
+    if (car.grounded && car.braking && spd > 20 && !car.drifting) want = Math.max(want, 0.008);
+    this.squealLvl += (want - this.squealLvl) * Math.min(1, (want > this.squealLvl ? 6 : 4) * dt);
+    this.squealFilters[0].frequency.setTargetAtTime(700 + slip * 700, t, 0.06);
+    this.squealFilters[1].frequency.setTargetAtTime(1150 + slip * 900 + spd * 4, t, 0.06);
+    this.squealGain.gain.setTargetAtTime(this.squealLvl, t, 0.06);
 
     // --- edge-triggered physics events ---
     const p = this.prev;
@@ -247,11 +312,11 @@ export class AudioSys {
       this.sfx("boost", car.boostFlash >= 0.9 ? 1 : 0.7);
     }
     if (car.padBoost > 0 && p.padBoost <= 0) this.sfx("pad");
-    if (car.grounded && !p.grounded && p.airTime > 0.15) this.sfx("land", clamp(0.5 + p.airTime, 0.5, 1.4));
+    if (car.grounded && !p.grounded && p.airTime > 0.15) this.sfx("land", clamp(0.5 + p.airTime, 0.5, 1.3));
     this.wallCooldown = Math.max(0, this.wallCooldown - dt);
     if (car.wallHit && !p.wallHit && this.wallCooldown <= 0) {
-      this.sfx("wall", clamp(0.4 + spd / 30, 0.4, 1.2));
-      this.wallCooldown = 0.25;
+      this.sfx("wall", clamp(0.35 + spd / 35, 0.35, 1.1));
+      this.wallCooldown = 0.3;
     }
     p.boostFlash = car.boostFlash;
     p.padBoost = car.padBoost;

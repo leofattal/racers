@@ -171,7 +171,7 @@ export class Environment {
 
   build(track) {
     this.dispose();
-    const P = this.palette = PALETTES[track.id] || PALETTES.apex;
+    const P = this.palette = PALETTES[track.def.palette] || PALETTES[track.id] || PALETTES.apex;
     const scene = this.scene;
     this.sunDir.set(...P.sunDir).normalize();
 
@@ -437,13 +437,18 @@ export class Environment {
     this.flags = [];
   }
 
-  // keep the shadow frustum centred on the player; animate clouds + flags
-  update(dt, focus) {
-    this.time += dt;
+  // centre the shadow frustum (and the sky dome) on a point: called once
+  // per viewport before rendering it
+  setFocus(focus) {
     this.sun.position.set(focus.x + this.sunDir.x * 160, focus.y + this.sunDir.y * 160, focus.z + this.sunDir.z * 160);
     this.sun.target.position.set(focus.x, focus.y, focus.z);
     this.sun.target.updateMatrixWorld();
     this.sky.position.set(focus.x, 0, focus.z);
+  }
+
+  // animate clouds + flags
+  update(dt) {
+    this.time += dt;
     for (const c of this.clouds) c.position.x += c.userData.drift * dt;
     for (const f of this.flags) {
       const pos = f.geometry.attributes.position;

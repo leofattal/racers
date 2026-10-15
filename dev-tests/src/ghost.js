@@ -67,7 +67,9 @@ export class GhostSystem {
     if (!this.best || lapTime < this.best.time) {
       this.best = { time: lapTime, t: r.t, x: r.x, y: r.y, z: r.z, h: r.h };
       this.bests[this.trackId] = this.best;
-      saveMem(`ghost-${this.trackId}`, { time: lapTime, t: r.t.map(q), x: r.x.map(q), y: r.y.map(q), z: r.z.map(q), h: r.h.map(q) });
+      if (!String(this.trackId).startsWith("random-")) { // random layouts are one-offs
+        saveMem(`ghost-${this.trackId}`, { time: lapTime, t: r.t.map(q), x: r.x.map(q), y: r.y.map(q), z: r.z.map(q), h: r.h.map(q) });
+      }
       return true;
     }
     return false;

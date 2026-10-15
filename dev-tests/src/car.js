@@ -94,10 +94,24 @@ export const SURFACES = {
 const clamp = THREE.MathUtils.clamp;
 
 // ---------------------------------------------------------------------------
+// CAR CLASSES — pick one in the menu. `engine` scales acceleration, `topSpeed`
+// scales the soft top speed independently (the quadratic drag is rebalanced
+// so a stronger engine does not also raise the top speed).
+// ---------------------------------------------------------------------------
+export const CAR_CLASSES = [
+  { id: "balanced", name: "BALANCED", engine: 1.0,  topSpeed: 1.0,  blurb: "the all-rounder" },
+  { id: "sprinter", name: "SPRINTER", engine: 1.24, topSpeed: 0.94, blurb: "launches hard, runs out of top end" },
+  { id: "bullet",   name: "BULLET",   engine: 0.86, topSpeed: 1.09, blurb: "lazy off the line, fastest on the straights" },
+];
+
+// ---------------------------------------------------------------------------
 // Shared car visual. ghost=true builds a translucent collision-free clone.
 // ---------------------------------------------------------------------------
 export function buildCarMesh(color = 0x3ea6ff, ghost = false) {
-  const group = new THREE.Group();
+  const outer = new THREE.Group();
+  const group = new THREE.Group(); // procedural parts; hidden when a real model is applied
+  outer.add(group);
+  outer.userData.procedural = group;
   const basic = (c, op = 0.32) => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: op, depthWrite: false });
   const paint = ghost ? basic(color)
     : new THREE.MeshStandardMaterial({ color, metalness: 0.55, roughness: 0.32, envMapIntensity: 0.9 });
@@ -163,11 +177,11 @@ export function buildCarMesh(color = 0x3ea6ff, ghost = false) {
 
   if (!ghost) group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
 
-  group.userData.wheels = wheels;
-  group.userData.frontAxle = [fl, fr];
-  group.userData.body = body;
-  group.userData.tailMat = ghost ? null : tailMat;
-  return group;
+  outer.userData.wheels = wheels;
+  outer.userData.frontAxle = [fl, fr];
+  outer.userData.body = body;
+  outer.userData.tailMat = ghost ? null : tailMat;
+  return outer;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +215,7 @@ export class Car {
     this.wheelSpin = 0;
     this.finished = false; // AI parks permanently after the final lap
     this.braking = false;  // brake lights
+    this.tuning = { engine: 1, topSpeed: 1 }; // car class multipliers (see CAR_CLASSES)
     this.lightGlow = 0.35; // smoothed tail-light intensity
 
     // vertical state (jumps)
@@ -363,7 +378,8 @@ export class Car {
     // --- longitudinal ---
     let nvLong = vLong;
     const eff = this.drifting ? C.ENGINE_DRIFT_EFF : 1;
-    if (input.throttle) nvLong += C.ENGINE * S.engine * input.throttle * this.engineScale * eff * dt;
+    const T = this.tuning;
+    if (input.throttle) nvLong += C.ENGINE * T.engine * S.engine * input.throttle * this.engineScale * eff * dt;
     if (input.brake) {
       if (nvLong > 0.4) nvLong -= C.BRAKE * input.brake * dt;
       else nvLong = Math.max(nvLong - C.BRAKE * 0.45 * input.brake * dt, -C.REVERSE_SPEED);
@@ -375,8 +391,10 @@ export class Car {
       this.padBoost -= dt;
       this.boostFlash = Math.max(this.boostFlash, 0.2);
     }
-    nvLong -= nvLong * C.DRAG * dt;
-    nvLong -= nvLong * Math.abs(nvLong) * C.QUAD_DRAG * dt;
+    // both drag terms scale with engine/topSpeed so the soft top speed is
+    // exactly TOP * topSpeed regardless of engine power
+    nvLong -= nvLong * (C.DRAG * T.engine / T.topSpeed) * dt;
+    nvLong -= nvLong * Math.abs(nvLong) * (C.QUAD_DRAG * T.engine / (T.topSpeed * T.topSpeed)) * dt;
     if (S.drag > 0 && Math.abs(nvLong) > 0.5) nvLong -= Math.sign(nvLong) * S.drag * dt; // dirt/rough drag
     nvLong = clamp(nvLong, -C.REVERSE_SPEED, C.HARD_CAP);
     if (pendingBoost > 0) {

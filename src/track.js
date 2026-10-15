@@ -152,6 +152,85 @@ function makeCheckerTexture(cols = 12, rows = 2) {
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// Random circuits. A star-shaped loop (radius = R * (1 + low harmonics))
+// can never cross itself; `trackDefIsSane` then rejects layouts whose legs
+// run too close together or whose corners are kinks, and the caller
+// re-rolls. Ramps, pads and surface zones are sprinkled along the lap.
+// ---------------------------------------------------------------------------
+export const PALETTE_IDS = ["apex", "skyway", "breeze", "rainbow"];
+
+export function randomTrackDef(seed) {
+  let st = (seed >>> 0) || 1;
+  const rng = () => { st = (st * 1664525 + 1013904223) >>> 0; return st / 4294967296; };
+  const n = 18 + Math.floor(rng() * 8);
+  const R = 178 + rng() * 60;
+  const harm = [
+    [2, 0.10 + rng() * 0.13], [3, 0.06 + rng() * 0.11], [4, rng() * 0.07],
+    [5, rng() * 0.05], [7, rng() * 0.025],
+  ].map(([k, a]) => [k, a, rng() * Math.PI * 2]);
+  const points = [];
+  for (let i = 0; i < n; i++) {
+    const th = (i / n) * Math.PI * 2;
+    let r = 1;
+    for (const [k, a, ph] of harm) r += a * Math.sin(k * th + ph);
+    const rr = R * r;
+    points.push([Math.round(rr * Math.cos(th)), Math.round(rr * Math.sin(th))]);
+  }
+  // features at well-separated control points (never on the start straight)
+  const used = new Set([0, 1, n - 1, n - 2]);
+  const pick = () => {
+    for (let tries = 0; tries < 40; tries++) {
+      const i = 2 + Math.floor(rng() * (n - 4));
+      if (![i - 1, i, i + 1].some((j) => used.has(j))) { used.add(i); return i; }
+    }
+    return -1;
+  };
+  const ramps = [], pads = [], surfaces = [];
+  const nRamps = 1 + Math.floor(rng() * 2.5), nPads = 2 + Math.floor(rng() * 2), nSurf = 1 + Math.floor(rng() * 2);
+  for (let k = 0; k < nRamps; k++) {
+    const i = pick(); if (i < 0) break;
+    const kicker = rng() < 0.65;
+    ramps.push({ near: points[i], len: kicker ? 50 + Math.round(rng() * 25) : 42 + Math.round(rng() * 12), h: kicker ? 3.2 + rng() * 3 : 2.2 + rng() * 0.8, type: kicker ? "kicker" : "table" });
+  }
+  for (let k = 0; k < nPads; k++) { const i = pick(); if (i < 0) break; pads.push({ near: points[i], len: 10 + Math.round(rng() * 3) }); }
+  for (let k = 0; k < nSurf; k++) { const i = pick(); if (i < 0) break; surfaces.push({ near: points[i], len: 70 + Math.round(rng() * 50), type: rng() < 0.5 ? "dirt" : "ice" }); }
+  const id = `random-${seed >>> 0}`;
+  return {
+    id, name: `RANDOM #${String((seed >>> 0) % 10000).padStart(4, "0")}`, random: true, seed: seed >>> 0,
+    scale: 1.0, hills: { a: 1.4 + rng() * 2.0, b: 0.8 + rng() * 1.0 },
+    palette: PALETTE_IDS[Math.floor(rng() * PALETTE_IDS.length)],
+    points, ramps, pads, surfaces,
+  };
+}
+
+// geometry-only sanity check: no kinks, no legs closer than a road width + margin
+export function trackDefIsSane(def) {
+  const t = new Track(null, def, false);
+  const N = t.N;
+  let maxK = 0;
+  for (let i = 0; i < N; i++) maxK = Math.max(maxK, Math.abs(t.kappa[i]));
+  if (maxK > 0.085) return false;
+  if (t.length < 1100 || t.length > 2600) return false;
+  const minSep = (2 * HALF_WIDTH + 12) ** 2;
+  for (let i = 0; i < N; i += 2) {
+    for (let j = i + 30; j < N - 30 + (i < 30 ? i : 0) && j < N; j += 2) {
+      const dx = t.px[i] - t.px[j], dz = t.pz[i] - t.pz[j];
+      if (dx * dx + dz * dz < minSep) return false;
+    }
+  }
+  return true;
+}
+
+// roll seeds until a sane layout appears
+export function makeRandomTrack(seed = (Math.random() * 2 ** 32) >>> 0) {
+  for (let k = 0; k < 60; k++) {
+    const def = randomTrackDef(seed + k * 7919);
+    if (trackDefIsSane(def)) return def;
+  }
+  return TRACKS[0];
+}
+
 const SAMPLES = 512;
 const HALF_WIDTH = 7.5;
 const GATE_COUNT = 8;
@@ -169,7 +248,7 @@ const kickerBump = (u) => {
 const rampProfile = (r, u) => (r.type === "table" ? tableBump(u) : kickerBump(u));
 
 export class Track {
-  constructor(scene, def = TRACKS[0]) {
+  constructor(scene, def = TRACKS[0], build = true) {
     this.def = def;
     this.id = def.id;
     this.name = def.name;
@@ -276,7 +355,11 @@ export class Track {
     this.gates = [];
     for (let g = 0; g < GATE_COUNT; g++) this.gates.push(g / GATE_COUNT * this.length);
 
-    this.buildMeshes(scene);
+    this.lineMesh = null;
+    this.padMats = [];
+    this.startLightMats = [];
+    this.pulseT = 0;
+    if (build) this.buildMeshes(scene);
   }
 
   // ride height of the circuit surface at arc length s: rolling terrain
@@ -423,6 +506,23 @@ export class Track {
       p.gateHits++;
     }
     return { crossed, gatePassed, lapValid: p.gate === 0 || p.gate === 1 };
+  }
+
+  // R: put the car back on the last checkpoint. The gate is taken from
+  // where the car IS (an ordered gate log goes stale after one missed gate),
+  // and the whole-lap distance is rebuilt from the laps actually completed,
+  // so a reset can never cost or credit a lap.
+  resetToCheckpoint(car) {
+    const p = car.prog, L = this.length, G = this.gates.length;
+    const beforeLine = !p || p.total < 0;
+    const lapsDone = p ? Math.max(0, Math.floor(p.total / L)) : 0;
+    const s = p ? p.s : 0;
+    const g = Math.floor((((s % L) + L) % L) / L * G) % G;
+    const pose = this.poseFor(this.gates[g] + 2, 0);
+    car.place(pose.x, pose.z, pose.heading, pose.y);
+    const np = this.initProgress(car);
+    if (!beforeLine) { np.total = lapsDone * L + np.s; np.lap = lapsDone; }
+    return pose;
   }
 
   // -- walls: soft-spring slide. Smooth positional recovery (no 60fps jitter
@@ -632,7 +732,6 @@ export class Track {
     }
 
     // glowing boost pads — alternating yellow/orange full-width bands (pulsed in update)
-    this.padMats = [];
     {
       for (const p of this.padsWorld) {
         const pos = [], col = [], idx = [];
@@ -667,7 +766,6 @@ export class Track {
     }
 
     // start/finish gantry: posts, checkered beam, five start lights
-    this.startLightMats = [];
     {
       const s0 = this.poseFor(0, 0);
       const n0x = Math.cos(s0.heading), n0z = -Math.sin(s0.heading);
@@ -705,8 +803,6 @@ export class Track {
         this.startLightMats.push(m);
       }
     }
-
-    this.pulseT = 0;
 
     // racing line hint (toggle with L) — wide, bright, lifted and
     // polygon-offset so it actually reads from the chase camera

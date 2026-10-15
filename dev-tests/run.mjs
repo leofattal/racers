@@ -2,7 +2,7 @@
 // Run: node dev-tests/run.mjs   (from the project root — imports use ./dev-tests/src)
 import * as THREE from "three";
 import { Car, resolveCarContacts, SURFACES } from "./src/car.js";
-import { Track, TRACKS } from "./src/track.js";
+import { Track, TRACKS, makeRandomTrack, trackDefIsSane, randomTrackDef } from "./src/track.js";
 import { AIDriver, AI_TIERS, finishCars } from "./src/ai.js";
 import { GhostSystem } from "./src/ghost.js";
 
@@ -113,6 +113,121 @@ for (const def of TRACKS) {
   check(maxK < 0.12, `${def.name}: no kinks`);
   check(road.material.side === THREE.DoubleSide, `${def.name}: road two-sided`);
   check(strips.every((m) => m.material.side === THREE.DoubleSide), `${def.name}: strips two-sided`);
+  track.dispose(scene);
+}
+
+/* ================= 2b) RANDOM CIRCUITS ==================================== */
+section("random circuits");
+{
+  let sane = 0;
+  for (let s = 1; s <= 50; s++) if (trackDefIsSane(randomTrackDef(s * 7777))) sane++;
+  console.log(`raw generator sanity: ${sane}/50`);
+  check(sane >= 30, "most raw random layouts are sane");
+  for (const seed of [11, 222, 3333]) {
+    const def = makeRandomTrack(seed);
+    check(def.random, `seed ${seed}: produced a random layout`);
+    const scene = new THREE.Scene();
+    const track = new Track(scene, def);
+    let maxK = 0;
+    for (let i = 0; i < track.N; i++) maxK = Math.max(maxK, Math.abs(track.kappa[i]));
+    check(maxK < 0.09, `seed ${seed}: no kinks (${maxK.toFixed(3)})`);
+    check(track.length > 1100, `seed ${seed}: long enough (${track.length.toFixed(0)}m)`);
+    // an AI must be able to lap it cleanly
+    const car = new Car(scene, 0xff0000, "RND");
+    const pose = track.poseFor(track.length - 16, 0);
+    car.place(pose.x, pose.z, pose.heading, pose.y);
+    track.initProgress(car);
+    const ai = new AIDriver(car, track, AI_TIERS[0]);
+    let walls = 0, frames = 0;
+    const dt = 1 / 60;
+    while (car.prog.lap < 1 && frames < 60 * 150) {
+      car.update(dt, ai.update(dt, null), track);
+      track.resolveCollision(car);
+      if (car.wallHit) walls++;
+      track.updateProgress(car);
+      frames++;
+    }
+    console.log(`${def.name}: len=${track.length.toFixed(0)} ramps=${track.rampsWorld.length} pads=${track.padsWorld.length} lapIn=${(frames / 60).toFixed(0)}s wallFrac=${(walls / frames).toFixed(3)}`);
+    check(car.prog.lap >= 1, `seed ${seed}: AI completes a lap`);
+    check(walls / frames < 0.1, `seed ${seed}: AI not wall-riding`);
+    track.dispose(scene);
+  }
+}
+
+/* ================= 2c) LAP COUNTING UNDER ABUSE ========================== */
+section("lap counting: spins, reversing, wall hits, checkpoint resets");
+{
+  let seed = 99; const rng = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const scene = new THREE.Scene();
+  const track = new Track(scene, TRACKS[0]);
+  const car = new Car(scene, 0x39a0ff, "YOU");
+  const pose = track.poseFor(track.length - 16, -2.6);
+  car.place(pose.x, pose.z, pose.heading, pose.y);
+  track.initProgress(car);
+  const pilot = new AIDriver(car, track, { name: "P", pace: 1.0, driftiness: 1.0 });
+  const LAPS = 3, dt = 1 / 60, L = track.length;
+  let frames = 0, crossings = 0, lapBegin = false, lapsCounted = 0, resets = 0, finishedAt = -1, badTotals = 0;
+  let mode = "drive", modeT = 0;
+  while (finishedAt < 0 && frames < 60 * 400) {
+    let inp = pilot.update(dt, null);
+    modeT -= dt;
+    if (modeT <= 0) { const r = rng(); mode = r < 0.6 ? "drive" : r < 0.75 ? "reverse" : r < 0.9 ? "spin" : "wall"; modeT = mode === "drive" ? 5 + rng() * 6 : 0.8 + rng() * 1.2; }
+    if (mode === "reverse") inp = { steer: 0, throttle: 0, brake: 1, handbrake: false };
+    if (mode === "spin") inp = { steer: 1, throttle: 1, brake: 0, handbrake: true };
+    if (mode === "wall") inp = { steer: -1, throttle: 1, brake: 0, handbrake: false };
+    if (rng() < 0.0008) { track.resetToCheckpoint(car); resets++; }
+    car.update(dt, inp, track);
+    track.resolveCollision(car);
+    const ev = track.updateProgress(car);
+    if (ev.crossed) {
+      crossings++;
+      const whole = car.prog.total / L;
+      if (Math.abs(whole - Math.round(whole)) > 0.01) badTotals++;
+      if (!lapBegin) lapBegin = true;
+      else if (car.prog.lap > lapsCounted) { lapsCounted = car.prog.lap; if (lapsCounted >= LAPS) finishedAt = frames; }
+    }
+    frames++;
+  }
+  console.log(`crossings=${crossings} resets=${resets} finished=${finishedAt >= 0} lapsCounted=${lapsCounted} badTotals=${badTotals} t=${(frames / 60).toFixed(0)}s`);
+  check(finishedAt >= 0, "race finishes despite chaos + resets");
+  check(badTotals === 0, "whole-lap distance is exact at every line crossing");
+  check(lapsCounted === LAPS, "exactly LAPS laps credited (no extra lap)");
+  // a reset right before the line must not cost a lap: car at 0.95 of lap 3
+  const p = car.prog; p.total = 2 * L + 0.95 * L; p.s = 0.95 * L; p.lap = 2;
+  const pz = track.poseFor(0.95 * L, 0); car.place(pz.x, pz.z, pz.heading, pz.y); p.s = 0.95 * L; p.total = 2.95 * L; p.lap = 2;
+  track.resetToCheckpoint(car);
+  check(car.prog.lap === 2 && car.prog.total > 2.85 * L && car.prog.total < 2.95 * L, `reset near the line keeps lap 3 (total=${(car.prog.total / L).toFixed(3)})`);
+  track.dispose(scene);
+}
+
+/* ================= 2d) HARD MODE ========================================= */
+section("hard mode bots");
+for (const def of [TRACKS[0], TRACKS[3]]) {
+  const scene = new THREE.Scene();
+  const track = new Track(scene, def);
+  const results = [];
+  for (const skill of [1.0, 1.14]) {
+    const car = new Car(scene, 0xff0000, "VEX");
+    const pose = track.poseFor(track.length - 16, 0);
+    car.place(pose.x, pose.z, pose.heading, pose.y);
+    track.initProgress(car);
+    const ai = new AIDriver(car, track, AI_TIERS[0]);
+    ai.setSkill(skill);
+    let frames = 0, walls = 0;
+    while (car.prog.lap < 2 && frames < 60 * 300) {
+      car.update(1 / 60, ai.update(1 / 60, { playerTotal: car.prog.total - 200 }), track);
+      track.resolveCollision(car);
+      if (car.wallHit) walls++;
+      track.updateProgress(car);
+      frames++;
+    }
+    results.push({ skill, t: frames / 60, wallFrac: walls / frames, laps: car.prog.lap });
+  }
+  const [n, h] = results;
+  console.log(`${def.name.padEnd(14)} normal 2 laps ${n.t.toFixed(1)}s walls ${n.wallFrac.toFixed(3)} | hard ${h.t.toFixed(1)}s walls ${h.wallFrac.toFixed(3)}`);
+  check(h.laps >= 2, `${def.name}: hard bot completes laps`);
+  check(h.t < n.t * 0.97, `${def.name}: hard bot is clearly faster`);
+  check(h.wallFrac < 0.15, `${def.name}: hard bot not wall-riding`);
   track.dispose(scene);
 }
 

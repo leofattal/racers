@@ -41,10 +41,14 @@ export class AIDriver {
     car.aiName = tier.name;
   }
 
-  // difficulty: scales top speed and engine (0.9 easy .. 1.06 hard)
+  // difficulty: scales top speed and engine (0.9 easy .. 1.14 hard). Above
+  // 1 the bots also carry more speed through corners and stop easing off
+  // when they lead (no rubber-band mercy).
   setSkill(k) {
     this.skill = k;
     this.topSpeed = CONFIG.TOP_SPEED * (0.94 + this.tier.pace * 0.06) * k;
+    this.cornerBoost = 1 + Math.max(0, k - 1) * 0.6;
+    this.mercy = k <= 1;
   }
 
   // ctx: { playerTotal } — race progress of the player, for rubber-banding
@@ -57,7 +61,7 @@ export class AIDriver {
     let rubber = 1;
     if (ctx && typeof ctx.playerTotal === "number" && car.prog) {
       const delta = ctx.playerTotal - car.prog.total; // >0 means this AI is behind
-      rubber = clamp(1 + delta * 0.0009, 0.94, 1.06);
+      rubber = clamp(1 + delta * 0.0009, this.mercy ? 0.94 : 1.0, 1.06);
     }
     car.engineScale = this.tier.pace * rubber * this.skill;
 
@@ -74,7 +78,7 @@ export class AIDriver {
     // --- speed control from upcoming curvature. Drift-happy tiers carry
     // excess speed into corners on purpose (they rotate with the handbrake).
     const csRaw = track.minCornerSpeed(s + v * 0.25, (v * v) / (2 * 26 * 0.55) + look * 0.5 + 14);
-    const speedBias = 1.13 + this.tier.driftiness * 0.14;
+    const speedBias = (1.13 + this.tier.driftiness * 0.14) * (this.cornerBoost || 1);
     const target = Math.min(csRaw * speedBias, this.topSpeed * rubber);
     let throttle = 0, brake = 0;
     if (v > target + 0.6) {
