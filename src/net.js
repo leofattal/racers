@@ -25,21 +25,53 @@ export function makeCode(len = 5) {
 
 export const netAvailable = () => typeof window !== "undefined" && !!window.Peer;
 
-// PeerJS ships STUN only; without a relay two players behind strict home or
-// mobile NATs never connect (the join just times out). Open Relay is a free
-// public TURN service; the game falls back to it when a direct path fails.
+// PeerJS ships STUN only; without a TURN relay two players behind strict home
+// or mobile NATs never connect (the join just times out). No free public relay
+// is dependable, so relay servers come from the site's own /api/turn endpoint
+// (configured with the operator's TURN account; see api/turn.js). STUN stays
+// as the baseline for direct connections.
 export const PEER_OPTIONS = {
   debug: 1,
   config: {
     iceServers: [
       { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-      { urls: "stun:openrelay.metered.ca:80" },
-      { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
     ],
   },
 };
+export const relayInfo = { loaded: false, source: "none", count: 0 };
+
+// fetch relay servers once; tolerate static hosts with no /api (404, HTML)
+export async function loadRelayServers(url = "/api/turn") {
+  if (relayInfo.loaded) return relayInfo;
+  relayInfo.loaded = true;
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return relayInfo;
+    const data = await r.json();
+    const servers = Array.isArray(data.iceServers) ? data.iceServers.filter((s) => s && s.urls) : [];
+    if (servers.length) {
+      PEER_OPTIONS.config.iceServers = [...PEER_OPTIONS.config.iceServers, ...servers];
+      relayInfo.source = data.source || "api";
+      relayInfo.count = servers.length;
+    }
+  } catch (e) { /* no relay available: direct connections only */ }
+  return relayInfo;
+}
+
+// "direct" | "relay" | "unknown": which path a live data connection took
+export async function linkType(conn) {
+  try {
+    const pc = conn && conn.peerConnection;
+    if (!pc) return "unknown";
+    const stats = await pc.getStats();
+    let pair = null;
+    stats.forEach((s) => { if (s.type === "candidate-pair" && (s.selected || s.nominated) && s.state === "succeeded") pair = s; });
+    if (!pair) return "unknown";
+    let local = null;
+    stats.forEach((s) => { if (s.id === pair.localCandidateId) local = s; });
+    return local && local.candidateType === "relay" ? "relay" : "direct";
+  } catch (e) { return "unknown"; }
+}
 
 class Emitter {
   constructor() { this.handlers = {}; }
@@ -57,7 +89,8 @@ export class NetHost extends Emitter {
     this.open = false;
   }
 
-  start(code = makeCode()) {
+  async start(code = makeCode()) {
+    await loadRelayServers();
     return new Promise((resolve, reject) => {
       this.code = code;
       this.pruneTimer = setInterval(() => this.prune(), 2000);
@@ -159,7 +192,8 @@ export class NetClient extends Emitter {
     this.inputSeq = 0;
   }
 
-  join(code, name, car) {
+  async join(code, name, car) {
+    await loadRelayServers();
     return new Promise((resolve, reject) => {
       this.code = code.toUpperCase().trim();
       this.mySlot = null;

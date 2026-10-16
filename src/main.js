@@ -15,7 +15,7 @@ import { Particles } from "./particles.js";
 import { SkidMarks } from "./skidmarks.js";
 import { Environment, makeLabel } from "./env.js";
 import { loadCarModel, applyCarModel } from "./models.js";
-import { NetHost, NetClient, netAvailable, packCar, unpackCar, applyRemote, stepRemote, MAX_PLAYERS } from "./net.js";
+import { NetHost, NetClient, netAvailable, packCar, unpackCar, applyRemote, stepRemote, MAX_PLAYERS, linkType, relayInfo } from "./net.js";
 import { loadMem, saveMem } from "./memory.js";
 import { Inline3D } from "./xr.js";
 import { Hazards } from "./hazards.js";
@@ -364,7 +364,7 @@ function startRace() {
 // --- online: lobby --------------------------------------------------------
 function rosterFor() {
   const list = [{ slot: 0, name: myName || "HOST", car: carChoice[0], host: true }];
-  if (mode === "host") for (const g of net.guests.values()) list.push({ slot: g.slot, name: g.name, car: g.car, host: false });
+  if (mode === "host") for (const g of net.guests.values()) list.push({ slot: g.slot, name: g.name, car: g.car, host: false, link: g.link || "" });
   return list;
 }
 
@@ -374,10 +374,13 @@ function renderLobby() {
   shared.showLobby({
     code: net && net.code,
     isHost: mode === "host",
-    players: roster.map((p) => ({ name: p.name, color: colorHex(PLAYER_COLORS[p.slot]), car: classById(p.car).name, host: p.host, me: p.slot === mySlot })),
-    note: mode === "host"
+    players: roster.map((p) => ({ name: p.name, color: colorHex(PLAYER_COLORS[p.slot]), car: classById(p.car).name, host: p.host, me: p.slot === mySlot,
+      tag: p.host ? "HOST" : (p.slot === mySlot && mode === "client" && net.linkText) ? net.linkText.toUpperCase() : (p.link || "").toUpperCase() })),
+    note: (mode === "host"
       ? `Share the code. Pick track, laps and difficulty in the menu behind, then START. ${roster.length}/${MAX_PLAYERS} racers.`
-      : `${net.hostTrack || "Host is picking the track"} · ${net.hostLaps || LAPS} laps · pick your CAR in the menu. Waiting for the host to start…`,
+      : `${net.hostTrack || "Host is picking the track"} · ${net.hostLaps || LAPS} laps · pick your CAR in the menu. Waiting for the host to start…`)
+      + `<br><span style="color:${relayInfo.count ? "#5fffb0" : "#ffb070"}">${relayInfo.count ? `relay server on (${relayInfo.source})` : "no relay server configured: players on different networks may fail to connect"}</span>`
+      + (net.linkText ? `<br>link: ${net.linkText}` : ""),
     onStart: () => { audio.ensure(); startRace(); },
     onLeave: () => leaveOnline("left the lobby"),
   });
@@ -404,7 +407,14 @@ async function hostLobby(name) {
   net = host;
   mode = "host";
   netStatus = `hosting · code ${host.code}`;
-  host.on("join", (id, g) => { renderLobby(); broadcastLobby(); views[0].hud.flashMsg(`${g.name} JOINED`, 1.5); })
+  host.on("join", (id, g) => {
+      renderLobby(); broadcastLobby(); views[0].hud.flashMsg(`${g.name} JOINED`, 1.5);
+      const poll = setInterval(async () => {
+        if (net !== host || !host.guests.has(id)) { clearInterval(poll); return; }
+        const t = await linkType(g.conn);
+        if (t !== "unknown" && g.link !== t) { g.link = t; if (state === "lobby") renderLobby(); }
+      }, 2000);
+    })
     .on("lobbyChange", () => { if (state === "lobby") { applySettings(); renderLobby(); } broadcastLobby(); })
     .on("leave", (id) => {
       const p = players.find((x) => x.remoteId === id);
@@ -434,7 +444,8 @@ async function joinLobby(code, name) {
   try {
     await client.join(code, myName || "GUEST", carChoice[0]);
   } catch (e) {
-    netStatus = "!could not join: " + (e.type === "peer-unavailable" ? "no lobby with that code" : (e.message || e));
+    netStatus = "!could not join: " + (e.type === "peer-unavailable" ? "no lobby with that code"
+      : /no answer/.test(e.message || "") ? "the host did not answer" + (relayInfo.count ? "" : " (different networks need a relay server: see README)") : (e.message || e));
     shared.setOnlineStatus(netStatus, true);
     return;
   }
@@ -444,6 +455,12 @@ async function joinLobby(code, name) {
   netStatus = `joined ${client.code}`;
   showMenu();
   for (const m of queued) onHostMessage(m);
+  // which path the link took (direct or through the relay), for the lobby note
+  const linkPoll = setInterval(async () => {
+    if (net !== client) { clearInterval(linkPoll); return; }
+    const t = await linkType(client.conn);
+    if (t !== "unknown" && client.linkText !== t) { client.linkText = t; if (state === "lobby") renderLobby(); }
+  }, 2000);
 }
 
 function leaveOnline(reason) {

@@ -243,7 +243,7 @@ export class SharedHUD {
     document.getElementById("lobby-code").textContent = lobby.code || "-----";
     document.getElementById("lobby-players").innerHTML = lobby.players.map((p) =>
       `<div class="row"><i style="background:${p.color}"></i><span>${p.name}${p.me ? " (you)" : ""}</span>` +
-      `<span class="car">${p.car}</span><span class="tag">${p.host ? "HOST" : ""}</span></div>`).join("");
+      `<span class="car">${p.car}</span><span class="tag">${p.tag || (p.host ? "HOST" : "")}</span></div>`).join("");
     document.getElementById("lobby-note").innerHTML = lobby.note || "";
     const start = document.getElementById("lobby-start");
     start.style.display = lobby.isHost ? "block" : "none";

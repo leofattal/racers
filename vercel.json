@@ -1,0 +1,3 @@
+{
+  "functions": { "api/turn.js": { "maxDuration": 10 } }
+}
