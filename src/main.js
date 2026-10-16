@@ -5,7 +5,7 @@
 import * as THREE from "three";
 import { Car, resolveCarContacts, CONFIG, CAR_CLASSES } from "./car.js";
 import { Keyboard } from "./input.js";
-import { Track, TRACKS, makeRandomTrack } from "./track.js";
+import { Track, TRACKS, makeRandomTrack, LapCounter } from "./track.js";
 import { ChaseCam } from "./camera.js";
 import { AIDriver, AI_TIERS, finishCars } from "./ai.js";
 import { GhostSystem } from "./ghost.js";
@@ -19,6 +19,12 @@ import { NetHost, NetClient, netAvailable, packCar, unpackCar, applyRemote, step
 import { loadMem, saveMem } from "./memory.js";
 import { Inline3D } from "./xr.js";
 import { Hazards } from "./hazards.js";
+
+// --- debug flags (URL query): ?norender skips drawing, ?autopilot lets the AI
+// drive the human seats. Both exist so a full race can run headlessly in tests.
+const DEBUG = new URLSearchParams(location.search);
+const NORENDER = DEBUG.has("norender");
+const AUTOPILOT = DEBUG.has("autopilot");
 
 // --- settings (persisted) ---------------------------------------------------
 const DIFFICULTY = { easy: 0.9, normal: 1.0, hard: 1.14 };
@@ -84,7 +90,8 @@ class Player {
     this.lapBegin = false;    // crossed the line once: lap 1 under way
     this.lapStartT = 0;
     this.lastLap = null;
-    this.lapsCounted = 0;     // completed laps credited so far
+    this.lapsCounted = 0;     // completed laps credited so far (mirrors this.laps.laps)
+    this.laps = track ? new LapCounter(track) : null;
     this.finished = false;
     this.wrongWayT = 0;
     this.prevGrounded = true;
@@ -149,6 +156,9 @@ let finishOrder = [];          // cars in the order they completed the race
 let lastTick = 0;              // last countdown digit that beeped
 let hintT = 0;                 // seconds of racing; the controls hint fades after a while
 let snapAcc = 0;               // host: time since the last snapshot
+let lastSnapAt = 0;            // client: performance.now() of the last snapshot
+let finishDeadline = null;     // raceTime by which everyone else must finish once someone has
+const FINISH_GRACE_S = 60;
 let netStatus = "";
 
 const ordinal = (n) => n + (n === 1 ? "st" : n === 2 ? "nd" : n === 3 ? "rd" : "th");
@@ -245,6 +255,8 @@ function restartRace() {
   lastTick = 0;
   hintT = 0;
   snapAcc = 0;
+  finishDeadline = null;
+  lastSnapAt = performance.now();
   for (const p of players) { p.resetRace(); }
   for (const v of views) v.hud.elHint.style.opacity = "1";
   for (const c of allCars) { c.score = 0; c.finished = false; c.netCorr = null; }
@@ -330,6 +342,8 @@ function showMenu() {
       showMenu();
     },
     onRace: () => { audio.ensure(); startRace(); },
+    raceLabel: mode === "client" ? "WAITING FOR THE HOST TO START…" : mode === "host" ? "START ONLINE RACE&nbsp;&nbsp;[ENTER]" : undefined,
+    raceDisabled: mode === "client",
   });
   shared.setOnlineStatus(netStatus, netStatus.startsWith("!"));
   if (isOnline()) renderLobby();
@@ -394,7 +408,11 @@ async function hostLobby(name) {
     .on("lobbyChange", () => { if (state === "lobby") { applySettings(); renderLobby(); } broadcastLobby(); })
     .on("leave", (id) => {
       const p = players.find((x) => x.remoteId === id);
-      if (p && state !== "lobby") { p.car.finished = true; p.car.mesh.visible = false; if (p.car.shadow) p.car.shadow.visible = false; }
+      if (p && state !== "lobby") {
+        p.finished = true; p.car.finished = true; p.car.mesh.visible = false; if (p.car.shadow) p.car.shadow.visible = false;
+        views[0].hud.flashMsg(`${p.name} LEFT`, 1.5);
+        if (state === "racing" && humans.every((h) => h.finished)) endRace();
+      }
       if (state === "lobby") { applySettings(); renderLobby(); placeOnGrid(); }
       broadcastLobby();
     })
@@ -502,6 +520,7 @@ function onClientEvent(m) {
 }
 
 function applySnapshot(m) {
+  lastSnapAt = performance.now();
   const prev = state;
   if (m.state === "countdown" || m.state === "racing") state = m.state;
   countdownT = m.cd;
@@ -539,7 +558,17 @@ function finishPlayer(pl, lapTime) {
   const local = locals.find((l) => l.player === pl);
   if (local) { local.view.hud.flashMsg(`FINISHED ${ordinal(pos)}`, 2.5); if (local.view.slot === 0) audio.sfx("finish"); }
   if (mode === "host" && pl.remoteId) net.send(pl.remoteId, { t: "ev", kind: "finish", lapTime, pos });
-  if (!humans.every((h) => h.finished)) return;
+  if (!humans.every((h) => h.finished)) {
+    // the rest get a grace period, then the race is called with DNFs
+    if (finishDeadline == null) finishDeadline = raceTime + FINISH_GRACE_S;
+    return;
+  }
+  endRace();
+}
+
+// everyone home (or out of time): results for all
+function endRace() {
+  if (state === "finished") return;
   // everyone home: results
   state = "finished";
   const rest = cars.filter((c) => !finishOrder.includes(c)).sort((a, b) => b.prog.total - a.prog.total);
@@ -557,11 +586,11 @@ function finishPlayer(pl, lapTime) {
   if (mode === "host") net.broadcast({ t: "results", html });
 }
 
-function onCrossedLine(pl) {
-  const car = pl.car;
+// lapEv comes from the player's LapCounter: "begin" (rolling start) or "lap"
+function onCrossedLine(pl, lapEv) {
   const local = locals.find((l) => l.player === pl);
   const primary = local && local.view.slot === 0;
-  if (!pl.lapBegin) {
+  if (lapEv === "begin") {
     // rolling start: crossing the line the first time begins lap 1
     pl.lapBegin = true;
     pl.lapStartT = raceTime;
@@ -569,11 +598,9 @@ function onCrossedLine(pl) {
     if (mode === "host" && pl.remoteId) net.send(pl.remoteId, { t: "ev", kind: "begin" });
     return;
   }
-  // a lap only counts when the car's whole-lap distance grew: spinning back
-  // and forth across the line never credits or double-credits a lap
-  const lapNow = car.prog.lap;
-  if (lapNow <= pl.lapsCounted || pl.finished) return;
-  pl.lapsCounted = lapNow;
+  if (pl.finished) return;
+  pl.lapsCounted = pl.laps.laps;
+  const lapNow = pl.lapsCounted;
   const lapTime = raceTime - pl.lapStartT;
   pl.lapStartT = raceTime;
   pl.lastLap = lapTime;
@@ -697,6 +724,7 @@ function focusView0() {
 
 // one viewport per local screen (top/bottom in split-screen)
 function renderViews() {
+  if (NORENDER) return;
   const w = window.innerWidth, h = window.innerHeight;
   if (locals.length !== 2 || state === "menu" || state === "lobby") {
     renderer.setScissorTest(false);
@@ -732,7 +760,11 @@ let lastFrameAt = performance.now();
 let frameCount = 0;
 // read-only debug readout (useful from the console / automated checks)
 window.__drift = { get state() { return state; }, get mode() { return mode; }, get raceTime() { return raceTime; }, get countdown() { return countdownT; }, get frames() { return frameCount; },
-  get mySlot() { return net ? net.mySlot : null; }, get guests() { return net && net.guests ? [...net.guests.values()].map((g) => g.name + ":" + g.slot + ":" + (g.conn.open ? "open" : "closed") + ":" + Math.round(performance.now() - g.lastSeen)) : null; }, get netStatus() { return netStatus; }, get localCar() { return locals[0] && locals[0].player ? locals[0].player.car.netId : null; },
+  get mySlot() { return net ? net.mySlot : null; },
+  get prog0() { const c = locals[0] && locals[0].player.car; return c && c.prog ? { s: +c.prog.s.toFixed(1), total: +c.prog.total.toFixed(1), lap: c.prog.lap, L: +track.length.toFixed(1) } : null; },
+  get hazard() { return hazards && hazards.active ? hazards.active.type : null; }, steps: { raf: 0, timer: 0, maxDt: 0 },
+  get laps() { return humans.map((p) => `${p.name}:counted=${p.lapsCounted}:lap=${(mode === "client" ? (p.car.netProg || p.car.prog) : p.car.prog).lap}:fin=${p.finished}`); },
+  get finishPanel() { return getComputedStyle(document.getElementById("finish-panel")).display === "block"; }, get guests() { return net && net.guests ? [...net.guests.values()].map((g) => g.name + ":" + g.slot + ":" + (g.conn.open ? "open" : "closed") + ":" + Math.round(performance.now() - g.lastSeen)) : null; }, get netStatus() { return netStatus; }, get localCar() { return locals[0] && locals[0].player ? locals[0].player.car.netId : null; },
   get humans() { return humans.map((p) => p.car.netId + ":" + p.name); }, get carsPos() { return cars.map((c) => [c.netId, +c.pos.x.toFixed(1), +c.pos.z.toFixed(1), c.mesh.visible]); },
   xr: { get available() { return stereo.available; }, get woven() { return stereo.woven; }, get scale() { return stereo.scale; }, get firstWoven() { return stereo.firstWoven; } } };
 
@@ -742,6 +774,7 @@ function frame(now) {
   if (!monoLoop) return;
   requestAnimationFrame(frame); // always re-arm first: a skipped duplicate must not end the chain
   if (isDuplicate(now)) return; // timer and rAF both fired: skip the duplicate
+  window.__drift.steps.raf++;
   if (step(now)) renderViews();
 }
 function startMonoLoop() {
@@ -764,6 +797,7 @@ function step(now) {
   let dt = Math.min((now - last) / 1000, 0.05);
   last = now;
   if (dt <= 0) return false;
+  if (dt > window.__drift.steps.maxDt) window.__drift.steps.maxDt = dt;
 
   if (state === "paused") {
     // frozen world: same frame re-rendered, sim and timers halted
@@ -785,7 +819,12 @@ function step(now) {
 
   const idle = { steer: 0, throttle: 0, brake: 0, handbrake: false };
   const inputs = new Map(); // player -> input
-  for (const l of locals) inputs.set(l.player, keyboard.sample(l.view.slot, locals.length === 2));
+  for (const l of locals) {
+    if (AUTOPILOT && state !== "countdown") {
+      if (!l.pilot || l.pilot.track !== track || l.pilot.car !== l.player.car) l.pilot = new AIDriver(l.player.car, track, { name: "AUTO", pace: 1.0, driftiness: 0.6 });
+      inputs.set(l.player, l.pilot.update(dt, null));
+    } else inputs.set(l.player, keyboard.sample(l.view.slot, locals.length === 2));
+  }
   if (mode === "host") for (const p of humans) if (p.remoteId) inputs.set(p, (net.guests.get(p.remoteId) || {}).input || idle);
   const myInput = inputs.get(locals[0].player) || idle;
 
@@ -855,7 +894,9 @@ function step(now) {
         const ev = track.updateProgress(car);
         const pl = humans.find((h) => h.car === car);
         if (pl) {
-          if (ev.crossed) onCrossedLine(pl);
+          if (!pl.laps || pl.laps.track !== track) pl.laps = new LapCounter(track);
+          const lapEv = pl.laps.update(car, ev);
+          if (lapEv) onCrossedLine(pl, lapEv);
           const l = locals.find((x) => x.player === pl);
           if (l) {
             // wrong-way warning: sustained backwards travel at speed
@@ -864,6 +905,12 @@ function step(now) {
             if (pl.wrongWayT > 0.8 && state === "racing") l.view.hud.flashMsg("WRONG WAY", 0.15);
           }
         }
+      }
+
+      // once someone has finished, the stragglers' clock is running
+      if (finishDeadline != null && raceTime > finishDeadline && state === "racing") {
+        for (const h of humans) if (!h.finished) { h.finished = true; h.car.finished = true; }
+        endRace();
       }
 
       // ghost: record this lap, replay the best (screen 1)
@@ -899,7 +946,7 @@ function step(now) {
     l.view.hud.update(dt, {
       speedKmh: car.speedKmh,
       speedFrac: car.speed / (CONFIG.TOP_SPEED * car.tuning.topSpeed),
-      lap: pr.lap + 1,
+      lap: p.lapsCounted + 1,
       laps: LAPS,
       finished: p.finished,
       curLap: p.lapBegin && !p.finished ? raceTime - p.lapStartT : null,
@@ -913,6 +960,15 @@ function step(now) {
       boostFlash: car.boostFlash,
       padBoost: car.padBoost,
     });
+  }
+  // online indicator / connection watchdog
+  if (mode === "host") shared.setNetStatus(`ONLINE · ${humans.length} RACER${humans.length === 1 ? "" : "S"}`);
+  else if (mode === "client") {
+    const silent = (performance.now() - lastSnapAt) / 1000;
+    shared.setNetStatus(silent > 3 ? `CONNECTION LOST · ${Math.floor(silent)}s` : `ONLINE · ${humans.length} RACERS`, silent > 3);
+  } else shared.setNetStatus("");
+  for (const l of locals) if (l.player.finished && state === "racing" && l.view.hud.msgTimer <= 0 && finishDeadline != null) {
+    l.view.hud.flashMsg(`WAITING FOR OTHERS · ${Math.max(0, Math.ceil(finishDeadline - raceTime))}s`, 0.3);
   }
   shared.drawMap([
     ...aiCars.filter((c) => !c.finished).map((c) => ({ x: c.pos.x, z: c.pos.z, color: colorHex(c.color), r: 3 })),
@@ -971,6 +1027,7 @@ requestAnimationFrame(frame);
 setInterval(() => {
   if (!isOnline() || performance.now() - lastFrameAt <= 90) return;
   const now = performance.now();
+  window.__drift.steps.timer++;
   if (stereo.woven) step(now);
   else if (step(now)) renderViews(); // never through frame(): that would start a second rAF chain
 }, 1000 / 30);

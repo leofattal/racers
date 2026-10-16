@@ -25,6 +25,22 @@ export function makeCode(len = 5) {
 
 export const netAvailable = () => typeof window !== "undefined" && !!window.Peer;
 
+// PeerJS ships STUN only; without a relay two players behind strict home or
+// mobile NATs never connect (the join just times out). Open Relay is a free
+// public TURN service; the game falls back to it when a direct path fails.
+export const PEER_OPTIONS = {
+  debug: 1,
+  config: {
+    iceServers: [
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      { urls: "stun:openrelay.metered.ca:80" },
+      { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+    ],
+  },
+};
+
 class Emitter {
   constructor() { this.handlers = {}; }
   on(ev, fn) { (this.handlers[ev] = this.handlers[ev] || []).push(fn); return this; }
@@ -45,7 +61,7 @@ export class NetHost extends Emitter {
     return new Promise((resolve, reject) => {
       this.code = code;
       this.pruneTimer = setInterval(() => this.prune(), 2000);
-      const peer = this.peer = new window.Peer(PREFIX + code, { debug: 1 });
+      const peer = this.peer = new window.Peer(PREFIX + code, PEER_OPTIONS);
       const fail = (err) => { this.destroy(); reject(err); };
       peer.on("open", () => { this.open = true; resolve(code); });
       peer.on("error", (err) => {
@@ -147,10 +163,10 @@ export class NetClient extends Emitter {
     return new Promise((resolve, reject) => {
       this.code = code.toUpperCase().trim();
       this.mySlot = null;
-      const peer = this.peer = new window.Peer(undefined, { debug: 1 });
+      const peer = this.peer = new window.Peer(undefined, PEER_OPTIONS);
       let settled = false;
       const fail = (err) => { if (settled) return; settled = true; this.destroy(); reject(err); };
-      const timer = setTimeout(() => fail(new Error("no answer from that code")), 12000);
+      const timer = setTimeout(() => fail(new Error("no answer from that code (host offline, or the connection could not be established)")), 20000);
       peer.on("error", (err) => { if (!settled) fail(err); else this.emit("error", err); });
       peer.on("open", () => {
         const conn = this.conn = peer.connect(PREFIX + this.code, { reliable: true, serialization: "json" });

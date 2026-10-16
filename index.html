@@ -90,6 +90,9 @@
   #hud-map { right: 22px; bottom: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px; }
   #map-canvas { display: block; }
   #hud-track { left: 50%; transform: translateX(-50%); bottom: 26px; font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #8fa5bd; text-shadow: 0 1px 3px #000; }
+  #net-status { display: none; left: 50%; transform: translateX(-50%); bottom: 8px; font-size: 11px; font-weight: 700; letter-spacing: 2px; color: #5fffb0; text-shadow: 0 1px 3px #000; }
+  #net-status.bad { color: #ff7a7a; font-size: 14px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
 
   .panel { top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 15;
     border: 1px solid var(--line); border-radius: 14px;
@@ -176,22 +179,22 @@
   "imports": {
     "three": "https://unpkg.com/three@0.148.0/build/three.module.js",
     "three/addons/": "https://unpkg.com/three@0.148.0/examples/jsm/",
-    "./src/main.js": "./src/main.js?v=20261016c",
-    "./src/car.js": "./src/car.js?v=20261016c",
-    "./src/track.js": "./src/track.js?v=20261016c",
-    "./src/ai.js": "./src/ai.js?v=20261016c",
-    "./src/hud.js": "./src/hud.js?v=20261016c",
-    "./src/env.js": "./src/env.js?v=20261016c",
-    "./src/audio.js": "./src/audio.js?v=20261016c",
-    "./src/input.js": "./src/input.js?v=20261016c",
-    "./src/camera.js": "./src/camera.js?v=20261016c",
-    "./src/ghost.js": "./src/ghost.js?v=20261016c",
-    "./src/particles.js": "./src/particles.js?v=20261016c",
-    "./src/skidmarks.js": "./src/skidmarks.js?v=20261016c",
-    "./src/memory.js": "./src/memory.js?v=20261016c",
-    "./src/models.js": "./src/models.js?v=20261016c",
-    "./src/xr.js": "./src/xr.js?v=20261016c",
-    "./src/hazards.js": "./src/hazards.js?v=20261016c"
+    "./src/main.js": "./src/main.js?v=20261016e",
+    "./src/car.js": "./src/car.js?v=20261016e",
+    "./src/track.js": "./src/track.js?v=20261016e",
+    "./src/ai.js": "./src/ai.js?v=20261016e",
+    "./src/hud.js": "./src/hud.js?v=20261016e",
+    "./src/env.js": "./src/env.js?v=20261016e",
+    "./src/audio.js": "./src/audio.js?v=20261016e",
+    "./src/input.js": "./src/input.js?v=20261016e",
+    "./src/camera.js": "./src/camera.js?v=20261016e",
+    "./src/ghost.js": "./src/ghost.js?v=20261016e",
+    "./src/particles.js": "./src/particles.js?v=20261016e",
+    "./src/skidmarks.js": "./src/skidmarks.js?v=20261016e",
+    "./src/memory.js": "./src/memory.js?v=20261016e",
+    "./src/models.js": "./src/models.js?v=20261016e",
+    "./src/xr.js": "./src/xr.js?v=20261016e",
+    "./src/hazards.js": "./src/hazards.js?v=20261016e"
   }
 }
 </script>
@@ -231,6 +234,7 @@
 
 <div id="hud-map" class="hud"><canvas id="map-canvas" width="170" height="170"></canvas></div>
 <div id="hud-track" class="hud">APEX CIRCUIT</div>
+<div id="net-status" class="hud"></div>
 
 <div id="finish-panel" class="hud panel">
   <h1>RACE FINISHED</h1>
@@ -280,6 +284,6 @@
 
 <!-- PeerJS (WebRTC signalling through its public broker) for online lobbies -->
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script type="module" src="./src/main.js?v=20261016c"></script>
+<script type="module" src="./src/main.js?v=20261016e"></script>
 </body>
 </html>

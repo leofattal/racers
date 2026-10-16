@@ -2,7 +2,7 @@
 // Run: node dev-tests/run.mjs   (from the project root — imports use ./dev-tests/src)
 import * as THREE from "three";
 import { Car, resolveCarContacts, SURFACES } from "./src/car.js";
-import { Track, TRACKS, makeRandomTrack, trackDefIsSane, randomTrackDef } from "./src/track.js";
+import { Track, TRACKS, makeRandomTrack, trackDefIsSane, randomTrackDef, LapCounter } from "./src/track.js";
 import { AIDriver, AI_TIERS, finishCars } from "./src/ai.js";
 import { GhostSystem } from "./src/ghost.js";
 import { Hazards, buildSchedule, HAZARD_TUNING } from "./src/hazards.js";
@@ -230,6 +230,56 @@ for (const def of [TRACKS[0], TRACKS[3]]) {
   check(h.laps >= 2, `${def.name}: hard bot completes laps`);
   check(h.t < n.t * 0.97, `${def.name}: hard bot is clearly faster`);
   check(h.wallFrac < 0.15, `${def.name}: hard bot not wall-riding`);
+  track.dispose(scene);
+}
+
+/* ================= 2e) LAP CREDIT RULE ==================================== */
+section("lap credit: reversing over the line, resets, drifted distance");
+{
+  const scene = new THREE.Scene();
+  const track = new Track(scene, TRACKS[0]);
+  const car = new Car(scene, 0x39a0ff, "YOU");
+  const pose = track.poseFor(track.length - 16, 0);
+  car.place(pose.x, pose.z, pose.heading, pose.y);
+  track.initProgress(car);
+  const pilot = new AIDriver(car, track, { name: "P", pace: 1.0, driftiness: 0.5 });
+  const lc = new LapCounter(track);
+  const dt = 1 / 60, L = track.length;
+  let frames = 0, events = [], phase = "drive", phaseT = 0, reversedOverLine = false;
+  while (lc.laps < 3 && frames < 60 * 420) {
+    let inp = pilot.update(dt, null);
+    // after lap 1: as soon as we are 15 m past the line, back up over it, then carry on
+    if (lc.laps === 1 && !reversedOverLine && car.prog.s > 15 && car.prog.s < 60) { phase = "reverse"; phaseT = 0; reversedOverLine = true; }
+    if (phase === "reverse") {
+      phaseT += dt;
+      inp = { steer: 0, throttle: 0, brake: 1, handbrake: false };
+      if (car.prog.s > L - 12 && car.prog.s < L - 3 && car.speed < 2) phase = "drive"; // we are behind the line again, parked
+      if (phaseT > 12) phase = "drive";
+    }
+    if (lc.laps === 2 && frames % 1800 === 900) track.resetToCheckpoint(car); // a few resets in lap 3
+    if (frames === 60 * 100) car.prog.total -= 300; // simulate a bookkeeping drift: must not matter
+    car.update(dt, inp, track);
+    track.resolveCollision(car);
+    const ev = track.updateProgress(car);
+    const le = lc.update(car, ev);
+    if (le) events.push(`${le}@${(frames / 60).toFixed(0)}s`);
+    frames++;
+  }
+  console.log(`events=[${events.join(",")}] reversedOverLine=${reversedOverLine} t=${(frames / 60).toFixed(0)}s`);
+  check(events[0] && events[0].startsWith("begin"), "first crossing is the rolling start");
+  check(lc.laps === 3, `exactly 3 laps credited (got ${lc.laps})`);
+  check(events.filter((e) => e.startsWith("lap")).length === 3, "no lap credited twice");
+  check(reversedOverLine, "test actually backed over the line");
+  // backing over the line and driving forward again must not credit a lap
+  const lc2 = new LapCounter(track);
+  const fake = { prog: { s: L - 10 } };
+  lc2.update(fake, { crossed: false, uncrossed: false });
+  fake.prog.s = 5; check(lc2.update(fake, { crossed: true, uncrossed: false }) === "begin", "rolling start begins");
+  for (const s of [0.2, 0.4, 0.5, 0.6]) { fake.prog.s = s * L; lc2.update(fake, { crossed: false, uncrossed: false }); }
+  fake.prog.s = 5; check(lc2.update(fake, { crossed: true, uncrossed: false }) === "lap", "full lap credited");
+  fake.prog.s = L - 5; lc2.update(fake, { crossed: false, uncrossed: true });   // backed over the line
+  fake.prog.s = 5; check(lc2.update(fake, { crossed: true, uncrossed: false }) === null, "re-crossing after backing up credits nothing");
+  fake.prog.s = 5; check(lc2.update(fake, { crossed: true, uncrossed: false }) === null, "a second forward crossing without a lap credits nothing");
   track.dispose(scene);
 }
 

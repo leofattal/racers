@@ -204,6 +204,31 @@ export function randomTrackDef(seed) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Lap credit that cannot be fooled. A forward line crossing counts only after
+// the car has been through the far half of the lap since its last credit;
+// backing over the line cancels that. It never reads the running distance, so
+// resets, spins, reversing or any bookkeeping drift can neither cost nor gift
+// a lap. The first crossing is the rolling start.
+// ---------------------------------------------------------------------------
+export class LapCounter {
+  constructor(track) { this.track = track; this.reset(); }
+  reset() { this.began = false; this.farSide = false; this.laps = 0; }
+  // call once per frame with the car and the event from track.updateProgress;
+  // returns "begin" | "lap" | null
+  update(car, ev) {
+    const f = car.prog.s / this.track.length;
+    if (f > 0.35 && f < 0.65) this.farSide = true;
+    if (ev.uncrossed) this.farSide = false;
+    if (!ev.crossed) return null;
+    if (!this.began) { this.began = true; this.farSide = false; return "begin"; }
+    if (!this.farSide) return null;
+    this.farSide = false;
+    this.laps++;
+    return "lap";
+  }
+}
+
 // geometry-only sanity check: no kinks, no legs closer than a road width + margin
 export function trackDefIsSane(def) {
   const t = new Track(null, def, false);
@@ -486,9 +511,9 @@ export class Track {
       ((car.pos.x - this.px[i]) * this.tx[i] + (car.pos.z - this.pz[i]) * this.tz[i]) / segLen));
     const s = (i + frac) / this.N * this.length;
     let d = s - p.s;
-    let crossed = false;
-    if (d < -this.length / 2) { d += this.length; crossed = true; }
-    else if (d > this.length / 2) d -= this.length;
+    let crossed = false, uncrossed = false;
+    if (d < -this.length / 2) { d += this.length; crossed = true; }        // forward over the line
+    else if (d > this.length / 2) { d -= this.length; uncrossed = true; }  // backed over the line
     p.total += d;
     p.s = s;
     if (p.total > 0) p.lap = Math.floor(p.total / this.length);
@@ -505,7 +530,7 @@ export class Track {
       p.gate = (g + 1) % GATE_COUNT;
       p.gateHits++;
     }
-    return { crossed, gatePassed, lapValid: p.gate === 0 || p.gate === 1 };
+    return { crossed, uncrossed, gatePassed, lapValid: p.gate === 0 || p.gate === 1 };
   }
 
   // R: put the car back on the last checkpoint. The gate is taken from

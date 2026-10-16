@@ -110,7 +110,8 @@ export class SharedHUD {
     this.mapBg.width = this.elMap.width;
     this.mapBg.height = this.elMap.height;
     this.trackTransform = null;
-    this.raceEls = [$("hud-map"), $("hud-track")];
+    this.elNet = $("net-status");
+    this.raceEls = [$("hud-map"), $("hud-track"), this.elNet];
   }
 
   setRaceHudVisible(v) {
@@ -205,7 +206,11 @@ export class SharedHUD {
       this.elOpts.appendChild(wrap);
     }
     this.elBlurb.textContent = opts.blurb || "";
-    document.getElementById("menu-race").onclick = opts.onRace;
+    const race = document.getElementById("menu-race");
+    race.innerHTML = opts.raceLabel || "RACE&nbsp;&nbsp;[ENTER]";
+    race.disabled = !!opts.raceDisabled;
+    race.style.opacity = opts.raceDisabled ? "0.55" : "1";
+    race.onclick = opts.raceDisabled ? null : opts.onRace;
   }
 
   hideMenu() {
@@ -248,6 +253,13 @@ export class SharedHUD {
   }
 
   hideLobby() { document.getElementById("lobby").style.display = "none"; }
+
+  // online indicator under the track name; "" hides it
+  setNetStatus(text, bad = false) {
+    if (this.elNet.textContent !== text) this.elNet.textContent = text;
+    this.elNet.classList.toggle("bad", bad);
+    this.elNet.style.display = text ? "block" : "none";
+  }
 
   // dots: [{x, z, color, r, ring}]
   drawMap(dots) {
