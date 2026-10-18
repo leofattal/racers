@@ -392,7 +392,7 @@ function broadcastLobby() {
 }
 
 async function hostLobby(name) {
-  if (!netAvailable()) { netStatus = "!online play needs the PeerJS script (no network?)"; shared.setOnlineStatus(netStatus, true); return; }
+  if (!netAvailable()) { netStatus = "!this browser has no WebRTC; online play needs it"; shared.setOnlineStatus(netStatus, true); return; }
   if (name) { myName = name.toUpperCase().slice(0, 10); saveMem("name", myName); }
   leaveOnline();
   const host = new NetHost();
@@ -432,7 +432,7 @@ async function hostLobby(name) {
 }
 
 async function joinLobby(code, name) {
-  if (!netAvailable()) { netStatus = "!online play needs the PeerJS script (no network?)"; shared.setOnlineStatus(netStatus, true); return; }
+  if (!netAvailable()) { netStatus = "!this browser has no WebRTC; online play needs it"; shared.setOnlineStatus(netStatus, true); return; }
   if (!code || code.length < 4) { shared.setOnlineStatus("enter the 5-letter invite code", true); return; }
   if (name) { myName = name.toUpperCase().slice(0, 10); saveMem("name", myName); }
   leaveOnline();
@@ -444,8 +444,7 @@ async function joinLobby(code, name) {
   try {
     await client.join(code, myName || "GUEST", carChoice[0]);
   } catch (e) {
-    netStatus = "!could not join: " + (e.type === "peer-unavailable" ? "no lobby with that code"
-      : /no answer/.test(e.message || "") ? "the host did not answer" + (relayInfo.count ? "" : " (different networks need a relay server: see README)") : (e.message || e));
+    netStatus = "!could not join: " + (/no answer/.test(e.message || "") ? "no lobby answered that code" + (relayInfo.count ? "" : " (check the code; different networks may need a relay server, see README)") : (e.message || e));
     shared.setOnlineStatus(netStatus, true);
     return;
   }

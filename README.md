@@ -9,9 +9,10 @@ Live: https://racers-psi.vercel.app
 - 2 players on one machine: PLAYERS → 2 SPLIT. Online: HOST LOBBY, share the 5-letter code, friends JOIN.
 
 ## Online play and the relay server
-Online races are peer-to-peer over WebRTC (PeerJS handles the handshake). Two players on
-different home or mobile networks usually need a TURN relay server, and no free public
-relay is dependable. The site asks its own endpoint, `/api/turn`, for relay servers;
+Online races are peer-to-peer over WebRTC. Matchmaking uses [Trystero](https://github.com/dmotz/trystero)
+over public Nostr relays (no account, no server of ours); game traffic then flows directly between
+players, end-to-end encrypted. Players on different home or mobile networks sometimes need a
+TURN relay server as well, and no free public relay is dependable. The site asks its own endpoint, `/api/turn`, for relay servers;
 configure one of these in the Vercel project's **Environment Variables** and redeploy:
 
 | Provider | Variables | Notes |

@@ -1,18 +1,22 @@
-// net.js — online play over WebRTC data channels. PeerJS (loaded as a
-// classic script in index.html, exposing window.Peer) handles signalling
-// through its public broker; after that, traffic is peer-to-peer.
+// net.js — online play over WebRTC data channels, matched through Trystero.
+// Trystero does peer discovery over public Nostr relays (no account, no
+// server of ours) and then the game traffic is peer-to-peer, end-to-end
+// encrypted. Everyone with the same invite code joins the same room; the
+// host announces itself and guests talk only to the host.
 //
 // Topology: host-authoritative star. The host runs the whole simulation
 // (its own car, every guest's car, the bots) from the guests' inputs and
 // broadcasts compact snapshots; guests predict their own car locally and
-// are corrected toward the host's version. Invite code = the host's peer id.
+// are corrected toward the host's version.
 //
-// Messages (JSON):
-//   guest -> host : hello{name,car} · car{car} · input{...} · reset
-//   host -> guest : lobby{...} · start{...} · snap{...} · ev{...} · results{html} · menu · kick{reason}
+// Messages (plain objects on one action):
+//   guest -> host : hello{name,car} · car{car} · input{...} · reset · ping
+//   host -> guest : host · you{slot} · lobby{...} · start{...} · snap{...} · ev{...} · results{html} · menu · kick{reason}
+
+import { joinRoom, selfId } from "trystero";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
-const PREFIX = "driftcircuit-";
+const APP_ID = "driftcircuit-v1";
 export const MAX_PLAYERS = 4;
 
 export function makeCode(len = 5) {
@@ -23,20 +27,12 @@ export function makeCode(len = 5) {
   return s;
 }
 
-export const netAvailable = () => typeof window !== "undefined" && !!window.Peer;
+export const netAvailable = () => typeof window !== "undefined" && typeof RTCPeerConnection === "function";
 
-// PeerJS ships STUN only; without a TURN relay two players behind strict home
-// or mobile NATs never connect (the join just times out). No free public relay
-// is dependable, so relay servers come from the site's own /api/turn endpoint
-// (configured with the operator's TURN account; see api/turn.js). STUN stays
-// as the baseline for direct connections.
-export const PEER_OPTIONS = {
-  debug: 1,
-  config: {
-    iceServers: [
-      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-    ],
-  },
+// STUN for direct connections; TURN relays (for strict NATs) come from the
+// site's /api/turn endpoint when the operator has configured one.
+export const RTC_CONFIG = {
+  iceServers: [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }],
 };
 export const relayInfo = { loaded: false, source: "none", count: 0 };
 
@@ -50,7 +46,7 @@ export async function loadRelayServers(url = "/api/turn") {
     const data = await r.json();
     const servers = Array.isArray(data.iceServers) ? data.iceServers.filter((s) => s && s.urls) : [];
     if (servers.length) {
-      PEER_OPTIONS.config.iceServers = [...PEER_OPTIONS.config.iceServers, ...servers];
+      RTC_CONFIG.iceServers = [...RTC_CONFIG.iceServers, ...servers];
       relayInfo.source = data.source || "api";
       relayInfo.count = servers.length;
     }
@@ -58,7 +54,7 @@ export async function loadRelayServers(url = "/api/turn") {
   return relayInfo;
 }
 
-// "direct" | "relay" | "unknown": which path a live data connection took
+// "direct" | "relay" | "unknown": which path a live connection took
 export async function linkType(conn) {
   try {
     const pc = conn && conn.peerConnection;
@@ -79,87 +75,70 @@ class Emitter {
   emit(ev, ...args) { for (const fn of this.handlers[ev] || []) fn(...args); }
 }
 
+// a thin handle per remote peer so the rest of the game can ask whether it
+// is open and read its RTCPeerConnection (link type, liveness)
+class PeerConn {
+  constructor(room, peerId) { this.room = room; this.peerId = peerId; this.open = true; }
+  get peerConnection() { const peers = this.room.getPeers(); return peers ? peers[this.peerId] || null : null; }
+}
+
+function openRoom(code) {
+  return joinRoom({ appId: APP_ID, rtcConfig: RTC_CONFIG }, `room-${code}`);
+}
+
 // ---------------------------------------------------------------------------
 export class NetHost extends Emitter {
   constructor() {
     super();
     this.code = null;
-    this.peer = null;
-    this.guests = new Map(); // peerId -> { conn, name, car, slot, input, lastSeen }
+    this.room = null;
+    this.action = null;
+    this.guests = new Map(); // peerId -> { conn, name, car, slot, input, lastSeen, link }
     this.open = false;
   }
 
   async start(code = makeCode()) {
     await loadRelayServers();
-    return new Promise((resolve, reject) => {
-      this.code = code;
-      this.pruneTimer = setInterval(() => this.prune(), 2000);
-      const peer = this.peer = new window.Peer(PREFIX + code, PEER_OPTIONS);
-      const fail = (err) => { this.destroy(); reject(err); };
-      peer.on("open", () => { this.open = true; resolve(code); });
-      peer.on("error", (err) => {
-        if (!this.open) fail(err); else this.emit("error", err);
-      });
-      peer.on("connection", (conn) => this._accept(conn));
-      peer.on("disconnected", () => { try { peer.reconnect(); } catch (e) { /* noop */ } });
-    });
+    this.code = code;
+    const room = this.room = openRoom(code);
+    this.action = room.makeAction("m");
+    this.action.onMessage = (m, meta) => this._onMessage(m, meta && meta.peerId);
+    // every arriving peer learns who the host is; guests reply with hello
+    room.onPeerJoin = (peerId) => { this.action.send({ t: "host" }, { target: peerId }); };
+    room.onPeerLeave = (peerId) => this._drop(peerId, "left");
+    this.open = true;
+    this.pruneTimer = setInterval(() => this.prune(), 2000);
+    return code;
   }
 
-  _accept(conn) {
-    const id = conn.peer;
-    conn.on("open", () => {
-      if (this.guests.size >= MAX_PLAYERS - 1) { conn.send({ t: "kick", reason: "lobby full" }); setTimeout(() => conn.close(), 200); return; }
-      const g = { conn, name: "GUEST", car: "balanced", slot: this._freeSlot(), input: null, lastSeen: performance.now() };
-      this.guests.set(id, g);
-      conn.send({ t: "you", slot: g.slot }); // first thing a guest learns: which seat is theirs
-      this.emit("join", id, g);
-    });
-    conn.on("data", (m) => {
-      const g = this.guests.get(id);
-      if (!g || !m || typeof m !== "object") return;
-      g.lastSeen = performance.now();
-      switch (m.t) {
-        case "hello":
-          g.name = String(m.name || "GUEST").slice(0, 10).toUpperCase() || "GUEST"; g.car = m.car || "balanced";
-          // a refreshed guest comes back under a new peer id before the old
-          // connection times out: drop the dead twin so its seat frees up
-          for (const [oid, og] of this.guests) if (oid !== id && og.name === g.name && this._isDead(og)) this._drop(oid, "stale twin");
-          this.emit("lobbyChange");
-          break;
-        case "ping": break;
-        case "car": g.car = m.car || "balanced"; this.emit("lobbyChange"); break;
-        case "input": g.input = { steer: +m.s || 0, throttle: +m.g || 0, brake: +m.b || 0, handbrake: !!m.h }; break;
-        case "reset": this.emit("reset", id); break;
+  _onMessage(m, id) {
+    if (!m || typeof m !== "object" || !id) return;
+    let g = this.guests.get(id);
+    if (m.t === "hello") {
+      if (!g) {
+        if (this.guests.size >= MAX_PLAYERS - 1) { this.action.send({ t: "kick", reason: "lobby full" }, { target: id }); return; }
+        g = { conn: new PeerConn(this.room, id), name: "GUEST", car: "balanced", slot: this._freeSlot(), input: null, lastSeen: performance.now(), link: "" };
+        this.guests.set(id, g);
       }
-    });
-    conn.on("close", () => this._drop(id, "closed"));
-    conn.on("error", (e) => this._drop(id, "error: " + (e && (e.type || e.message) || e)));
-  }
-
-  _drop(id, reason = "") {
-    const g = this.guests.get(id);
+      g.name = String(m.name || "GUEST").slice(0, 10).toUpperCase() || "GUEST";
+      g.car = m.car || "balanced";
+      g.lastSeen = performance.now();
+      // a refreshed guest comes back under a new peer id before the old
+      // connection times out: drop the dead twin so its seat frees up
+      for (const [oid, og] of this.guests) if (oid !== id && og.name === g.name && this._isDead(og)) this._drop(oid, "stale twin");
+      this.action.send({ t: "you", slot: g.slot }, { target: id }); // first thing a guest learns: which seat is theirs
+      this.emit("join", id, g);
+      this.emit("lobbyChange");
+      return;
+    }
     if (!g) return;
-    console.warn(`[net] dropping ${g.name} (slot ${g.slot}): ${reason}`);
-    this.guests.delete(id);
-    try { g.conn.close(); } catch (e) { /* noop */ }
-    this.emit("leave", id);
-  }
-
-  // liveness comes from the transport, never from message cadence: a guest in
-  // a background tab sends nothing for a long time and is still connected
-  _isDead(g) {
-    if (!g.conn.open) return true;
-    const pc = g.conn.peerConnection;
-    const ice = pc ? pc.iceConnectionState : "connected";
-    if (ice === "failed" || ice === "closed") return true;
-    if (ice === "disconnected") { g.disconnectedSince = g.disconnectedSince || performance.now(); return performance.now() - g.disconnectedSince > 10000; }
-    g.disconnectedSince = null;
-    return false;
-  }
-
-  // dead links (closed laptop, lost network) are pruned so their seat frees up
-  prune() {
-    for (const [id, g] of [...this.guests]) if (this._isDead(g)) this._drop(id, `dead link (${g.conn.open ? g.conn.peerConnection?.iceConnectionState : "channel closed"})`);
+    g.lastSeen = performance.now();
+    switch (m.t) {
+      case "car": g.car = m.car || "balanced"; this.emit("lobbyChange"); break;
+      case "input": g.input = { steer: +m.s || 0, throttle: +m.g || 0, brake: +m.b || 0, handbrake: !!m.h }; break;
+      case "reset": this.emit("reset", id); break;
+      case "ping": break;
+    }
   }
 
   _freeSlot() {
@@ -168,15 +147,41 @@ export class NetHost extends Emitter {
     return MAX_PLAYERS - 1;
   }
 
-  send(id, msg) { const g = this.guests.get(id); if (g && g.conn.open) g.conn.send(msg); }
-  broadcast(msg) { for (const g of this.guests.values()) if (g.conn.open) g.conn.send(msg); }
+  _drop(id, reason = "") {
+    const g = this.guests.get(id);
+    if (!g) return;
+    console.warn(`[net] dropping ${g.name} (slot ${g.slot}): ${reason}`);
+    g.conn.open = false;
+    this.guests.delete(id);
+    this.emit("leave", id);
+  }
+
+  // liveness comes from the transport, never from message cadence: a guest in
+  // a background tab sends nothing for a long time and is still connected
+  _isDead(g) {
+    if (!g.conn.open) return true;
+    const pc = g.conn.peerConnection;
+    if (!pc) return performance.now() - g.lastSeen > 15000; // room no longer lists the peer
+    const ice = pc.iceConnectionState;
+    if (ice === "failed" || ice === "closed") return true;
+    if (ice === "disconnected") { g.disconnectedSince = g.disconnectedSince || performance.now(); return performance.now() - g.disconnectedSince > 10000; }
+    g.disconnectedSince = null;
+    return false;
+  }
+
+  prune() {
+    for (const [id, g] of [...this.guests]) if (this._isDead(g)) this._drop(id, "dead link");
+  }
+
+  send(id, msg) { const g = this.guests.get(id); if (g && g.conn.open) this.action.send(msg, { target: id }); }
+  broadcast(msg) { for (const [id, g] of this.guests) if (g.conn.open) this.action.send(msg, { target: id }); }
 
   destroy() {
     clearInterval(this.pruneTimer);
-    for (const g of this.guests.values()) { try { g.conn.close(); } catch (e) { /* noop */ } }
+    for (const g of this.guests.values()) g.conn.open = false;
     this.guests.clear();
-    if (this.peer) { try { this.peer.destroy(); } catch (e) { /* noop */ } }
-    this.peer = null;
+    if (this.room) { try { this.room.leave(); } catch (e) { /* noop */ } }
+    this.room = null;
     this.open = false;
   }
 }
@@ -185,48 +190,53 @@ export class NetHost extends Emitter {
 export class NetClient extends Emitter {
   constructor() {
     super();
-    this.peer = null;
-    this.conn = null;
+    this.room = null;
+    this.action = null;
+    this.conn = null;        // PeerConn to the host
+    this.hostId = null;
     this.code = null;
     this.connected = false;
     this.inputSeq = 0;
+    this.mySlot = null;
   }
 
   async join(code, name, car) {
     await loadRelayServers();
+    this.code = code.toUpperCase().trim();
+    const room = this.room = openRoom(this.code);
+    this.action = room.makeAction("m");
     return new Promise((resolve, reject) => {
-      this.code = code.toUpperCase().trim();
-      this.mySlot = null;
-      const peer = this.peer = new window.Peer(undefined, PEER_OPTIONS);
       let settled = false;
       const fail = (err) => { if (settled) return; settled = true; this.destroy(); reject(err); };
-      const timer = setTimeout(() => fail(new Error("no answer from that code (host offline, or the connection could not be established)")), 20000);
-      peer.on("error", (err) => { if (!settled) fail(err); else this.emit("error", err); });
-      peer.on("open", () => {
-        const conn = this.conn = peer.connect(PREFIX + this.code, { reliable: true, serialization: "json" });
-        conn.on("open", () => {
-          clearTimeout(timer);
-          settled = true;
-          this.connected = true;
-          conn.send({ t: "hello", name, car });
-          this.pingTimer = setInterval(() => this.send({ t: "ping" }), 1500);
-          resolve();
-        });
-        // the seat assignment is handled here so it is never lost to handler
-        // ordering: it arrives before the lobby roster and before any start
-        conn.on("data", (m) => {
-          if (!m || typeof m !== "object") return;
-          if (m.t === "you") this.mySlot = m.slot;
-          this.emit("msg", m);
-        });
-        const gone = () => { const was = this.connected; this.connected = false; if (was) this.emit("disconnect"); else fail(new Error("could not reach host")); };
-        conn.on("close", gone);
-        conn.on("error", gone);
-      });
+      const timer = setTimeout(() => fail(new Error("no answer from that code")), 25000);
+      this.action.onMessage = (m, meta) => {
+        const from = meta && meta.peerId;
+        if (!m || typeof m !== "object" || !from) return;
+        if (m.t === "host" && !this.hostId) {
+          // the host announced itself: this is who we talk to
+          this.hostId = from;
+          this.conn = new PeerConn(room, from);
+          this.action.send({ t: "hello", name, car }, { target: from });
+          return;
+        }
+        if (from !== this.hostId) return;
+        if (m.t === "you") {
+          this.mySlot = m.slot;
+          if (!settled) { clearTimeout(timer); settled = true; this.connected = true; this.pingTimer = setInterval(() => this.send({ t: "ping" }), 1500); resolve(); }
+        }
+        this.emit("msg", m);
+      };
+      room.onPeerLeave = (peerId) => {
+        if (peerId !== this.hostId) return;
+        const was = this.connected;
+        this.connected = false;
+        if (this.conn) this.conn.open = false;
+        if (was) this.emit("disconnect"); else fail(new Error("the host went away"));
+      };
     });
   }
 
-  send(msg) { if (this.conn && this.conn.open) this.conn.send(msg); }
+  send(msg) { if (this.connected && this.hostId && this.action) this.action.send(msg, { target: this.hostId }); }
 
   sendInput(inp) {
     this.send({ t: "input", q: ++this.inputSeq, s: +inp.steer.toFixed(3), g: +inp.throttle.toFixed(2), b: +inp.brake.toFixed(2), h: inp.handbrake ? 1 : 0 });
@@ -234,13 +244,15 @@ export class NetClient extends Emitter {
 
   destroy() {
     clearInterval(this.pingTimer);
-    if (this.conn) { try { this.conn.close(); } catch (e) { /* noop */ } }
-    if (this.peer) { try { this.peer.destroy(); } catch (e) { /* noop */ } }
-    this.conn = null;
-    this.peer = null;
+    if (this.room) { try { this.room.leave(); } catch (e) { /* noop */ } }
+    if (this.conn) this.conn.open = false;
+    this.room = null;
+    this.action = null;
     this.connected = false;
   }
 }
+
+export { selfId };
 
 // ---------------------------------------------------------------------------
 // snapshot packing: one flat array per car keeps the 20 Hz stream small
